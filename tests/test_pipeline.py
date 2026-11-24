@@ -634,7 +634,10 @@ async def test_daily_llm_budget_atomic_under_50_concurrent_calls(tmp_path: Path)
             for i in range(50)
         ]
     )
-    await asyncio.sleep(0.25)
+    for _ in range(100):
+        if len(notifier.review_cards) >= 50:
+            break
+        await asyncio.sleep(0.05)
 
     assert len(llm.calls) == 10
     assert await db.get_daily_llm_calls() == 10
@@ -905,88 +908,6 @@ async def test_edited_message_catches_bait_and_switch_during_probation(tmp_path:
     assert len(llm.calls) == 2  # still only the 2 calls for 9701
     friend = await db.get_user(9702)
     assert friend is not None and friend.status == UserStatus.WHITELISTED
-
-    await pipeline.shutdown()
-    await db.close()
-
-
-def test_parse_duration_seconds() -> None:
-    from antispam.core.pipeline import format_remaining, parse_duration_seconds
-
-    assert parse_duration_seconds("30m") == 1800
-    assert parse_duration_seconds("2h") == 7200
-    assert parse_duration_seconds("1h30m") == 5400
-    assert parse_duration_seconds("1d") == 86400
-    assert parse_duration_seconds("1m") is None  # below 5m min
-    assert parse_duration_seconds("30d") is None  # above 7d max
-    assert parse_duration_seconds("abc") is None
-    assert format_remaining(5400) == "1小时30分钟"
-
-
-@pytest.mark.asyncio
-async def test_lockdown_relax_budget_override_and_reset_user(tmp_path: Path) -> None:
-    db = Database(tmp_path / "dynamic_modes.db")
-    await db.connect()
-    tg = FakeTelegramActions()
-    notifier = FakeNotifier()
-    llm = FakeLLM(
-        [
-            # Confidence 0.68 is below default pass_auto_allow (0.75),
-            # but >= relaxed threshold (0.65), so it should auto-pass during /relax!
-            LLMVerdict(
-                decision=DecisionType.PASS,
-                confidence=0.68,
-                category="normal",
-                reason="符合临时招聘场景的求职联系",
-            )
-        ]
-    )
-
-    pipeline = ModerationPipeline(
-        cfg=_fast_cfg(RunMode.AUTO), db=db, tg=tg, notifier=notifier, llm=llm  # type: ignore[arg-type]
-    )
-
-    # 1. Lockdown mode: holds stranger silently with ZERO LLM calls and ZERO review cards
-    await pipeline.set_lockdown(3600)
-    await pipeline.handle_incoming_message(
-        IncomingMessage(user_id=9801, tg_msg_id=1, text="广告轰炸", display_name="Flood1")
-    )
-    await asyncio.sleep(0.12)
-    assert len(llm.calls) == 0
-    assert len(notifier.review_cards) == 0
-    assert (9801, True) in tg.archived
-    u_locked = await db.get_user(9801)
-    assert u_locked is not None and u_locked.status == UserStatus.PENDING_REVIEW
-
-    # 2. Enabling relax automatically clears lockdown and injects relax_note + lowers pass threshold
-    await pipeline.set_relax(3600, "刚在前端群发了招聘，放行求职咨询")
-    assert await pipeline.get_lockdown_state() is None
-    await pipeline.handle_incoming_message(
-        IncomingMessage(user_id=9802, tg_msg_id=2, text="你好看到你的招聘贴", display_name="Candidate")
-    )
-    await asyncio.sleep(0.12)
-    assert len(llm.calls) == 1
-    assert llm.calls[0]["relax_note"] == "刚在前端群发了招聘，放行求职咨询"
-    u_relaxed = await db.get_user(9802)
-    assert u_relaxed is not None and u_relaxed.status == UserStatus.WHITELISTED
-
-    # 3. Hot budget override takes effect immediately
-    assert await pipeline.set_daily_budget_override(1) == 1
-    # Budget is already 1/1 -> next stranger hits budget guard without calling LLM
-    await pipeline.handle_incoming_message(
-        IncomingMessage(user_id=9803, tg_msg_id=3, text="你好", display_name="BudgetHit")
-    )
-    await asyncio.sleep(0.12)
-    assert len(llm.calls) == 1
-    assert any(c["verdict"].model_used == "budget_guard" for c in notifier.review_cards)
-
-    # 4. Whitelist removal & reset_user clean DB rows cleanly
-    removed, in_static = await pipeline.remove_from_whitelist(9802)
-    assert removed is True and in_static is False
-    assert await db.get_user(9802) is None
-    assert await pipeline.reset_user(9801) is True
-    assert await db.get_user(9801) is None
-    assert await db.get_recent_messages(9801) == []
 
     await pipeline.shutdown()
     await db.close()

@@ -2,11 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import Any
 
 from antispam.config import AppConfig
 from antispam.core.enricher import ProfileEnricher
@@ -25,41 +23,6 @@ from antispam.models import (
 from antispam.storage.db import Database, utc_now_iso
 
 logger = logging.getLogger(__name__)
-
-_DURATION_PART_RE = re.compile(r"(\d+)\s*([mhd])", re.IGNORECASE)
-_MIN_TEMP_MODE_SECONDS = 5 * 60
-_MAX_TEMP_MODE_SECONDS = 7 * 24 * 3600
-
-
-def parse_duration_seconds(raw: str) -> int | None:
-    """Parse duration like '30m', '2h', '1d', '1h30m' into seconds (5m .. 7d)."""
-    cleaned = raw.strip().lower()
-    if not cleaned:
-        return None
-    matches = list(_DURATION_PART_RE.finditer(cleaned))
-    if not matches or "".join(m.group(0) for m in matches).replace(" ", "") != cleaned.replace(
-        " ", ""
-    ):
-        return None
-    multipliers = {"m": 60, "h": 3600, "d": 86400}
-    total = sum(int(m.group(1)) * multipliers[m.group(2).lower()] for m in matches)
-    if total < _MIN_TEMP_MODE_SECONDS or total > _MAX_TEMP_MODE_SECONDS:
-        return None
-    return total
-
-
-def format_remaining(seconds: float) -> str:
-    mins = max(1, int((seconds + 59) // 60))
-    days, rem = divmod(mins, 1440)
-    hours, rem_mins = divmod(rem, 60)
-    parts: list[str] = []
-    if days:
-        parts.append(f"{days}天")
-    if hours:
-        parts.append(f"{hours}小时")
-    if rem_mins or not parts:
-        parts.append(f"{rem_mins}分钟")
-    return "".join(parts)
 
 
 @dataclass
@@ -118,65 +81,6 @@ class ModerationPipeline:
     async def set_run_mode(self, mode: RunMode) -> None:
         await self.db.set_run_mode(mode)
         logger.info("Runtime mode switched to: %s", mode.value)
-
-    async def get_effective_daily_budget(self) -> int:
-        override = await self.db.get_daily_budget_override()
-        return override if override is not None else self.cfg.rate_limit.daily_llm_budget_calls
-
-    async def set_daily_budget_override(self, budget: int | None) -> int:
-        await self.db.set_daily_budget_override(budget)
-        effective = await self.get_effective_daily_budget()
-        logger.info("Effective daily LLM budget updated to: %s", effective)
-        return effective
-
-    async def get_relax_state(self) -> dict[str, Any] | None:
-        return await self.db.get_timed_state("relax_state", time.time())
-
-    async def set_relax(self, duration_seconds: int, note: str = "") -> dict[str, Any]:
-        until = time.time() + duration_seconds
-        payload = {"until": until, "note": note.strip()}
-        await self.db.set_timed_state("lockdown_state", None)
-        await self.db.set_timed_state("relax_state", payload)
-        logger.info("Relax mode enabled for %ss (note=%r)", duration_seconds, note.strip())
-        return {**payload, "remaining_seconds": float(duration_seconds)}
-
-    async def clear_relax(self) -> None:
-        await self.db.set_timed_state("relax_state", None)
-        logger.info("Relax mode disabled")
-
-    async def get_lockdown_state(self) -> dict[str, Any] | None:
-        return await self.db.get_timed_state("lockdown_state", time.time())
-
-    async def set_lockdown(self, duration_seconds: int) -> dict[str, Any]:
-        until = time.time() + duration_seconds
-        payload = {"until": until}
-        await self.db.set_timed_state("relax_state", None)
-        await self.db.set_timed_state("lockdown_state", payload)
-        logger.info("Lockdown mode enabled for %ss", duration_seconds)
-        return {**payload, "remaining_seconds": float(duration_seconds)}
-
-    async def clear_lockdown(self) -> None:
-        await self.db.set_timed_state("lockdown_state", None)
-        logger.info("Lockdown mode disabled")
-
-    async def reset_user(self, user_id: int) -> bool:
-        async with self._lock_for(user_id):
-            self._cancel_pending(user_id)
-            self.enricher.invalidate(user_id)
-            return await self.db.delete_user_and_messages(user_id)
-
-    async def remove_from_whitelist(
-        self, user_id: int, username: str | None = None
-    ) -> tuple[bool, bool]:
-        in_static = self._is_static_whitelisted(user_id, username)
-        async with self._lock_for(user_id):
-            self._cancel_pending(user_id)
-            self.enricher.invalidate(user_id)
-            user = await self.db.get_user(user_id)
-            if user is None or user.status != UserStatus.WHITELISTED:
-                return False, in_static
-            removed = await self.db.delete_user_and_messages(user_id)
-            return removed, in_static
 
     def _is_static_whitelisted(self, user_id: int, username: str | None) -> bool:
         if user_id in self.cfg.screening.whitelist_user_ids:
@@ -383,26 +287,6 @@ class ModerationPipeline:
                 ):
                     await self.db.set_user_flags(user_id, muted=True)
 
-                if await self.get_lockdown_state() is not None:
-                    self._cancel_pending(user_id)
-                    await self.db.update_user_status(
-                        user_id,
-                        UserStatus.PENDING_REVIEW,
-                        category="lockdown",
-                        confidence=0.5,
-                        reason="锁门模式激活中，已静默归档暂存（未调用 LLM）",
-                    )
-                    await self.db.add_audit_log(
-                        user_id=user_id,
-                        decision="review",
-                        confidence=0.5,
-                        category="lockdown",
-                        reason="锁门模式静默暂存",
-                        action_taken="lockdown_hold",
-                        model_used="lockdown",
-                    )
-                    return
-
             self._enqueue_for_debounce(msg)
 
     def _enqueue_for_debounce(self, msg: IncomingMessage) -> None:
@@ -518,26 +402,6 @@ class ModerationPipeline:
                 ):
                     await self.db.set_user_flags(user_id, muted=True)
 
-                if await self.get_lockdown_state() is not None:
-                    self._cancel_pending(user_id)
-                    await self.db.update_user_status(
-                        user_id,
-                        UserStatus.PENDING_REVIEW,
-                        category="lockdown",
-                        confidence=0.5,
-                        reason="锁门模式激活中，已静默归档暂存（未调用 LLM）",
-                    )
-                    await self.db.add_audit_log(
-                        user_id=user_id,
-                        decision="review",
-                        confidence=0.5,
-                        category="lockdown",
-                        reason="锁门模式静默暂存",
-                        action_taken="lockdown_hold",
-                        model_used="lockdown",
-                    )
-                    return
-
             self._enqueue_for_debounce(msg)
 
     # ---------- Human Takeover ----------
@@ -607,15 +471,11 @@ class ModerationPipeline:
             if not (item.direction == "in" and item.tg_msg_id in batch_msg_ids)
         ]
 
-        relax = await self.get_relax_state()
-        relax_note = str(relax.get("note", "")).strip() if relax else None
-
         verdict = await self._evaluate_verdict(
             profile=profile,
             prior_history=prior_history,
             batch=batch,
             probe_count=user.probe_count,
-            relax_note=relax_note or None,
         )
 
         # Safety guard 1: never auto-pass high-risk executable attachments
@@ -654,7 +514,6 @@ class ModerationPipeline:
             images=images,
             verdict=verdict,
             run_mode=run_mode,
-            relax_active=relax is not None,
         )
 
     async def _evaluate_verdict(
@@ -664,7 +523,6 @@ class ModerationPipeline:
         prior_history: list,
         batch: list[IncomingMessage],
         probe_count: int,
-        relax_note: str | None = None,
     ) -> LLMVerdict:
         # Stage 1: Local fast rules
         rules = await self.db.list_rules(enabled_only=True)
@@ -688,7 +546,7 @@ class ModerationPipeline:
             )
 
         # Stage 2: Daily LLM budget circuit breaker (atomic check + reserve)
-        budget = await self.get_effective_daily_budget()
+        budget = self.cfg.rate_limit.daily_llm_budget_calls
         reserved, used_today = await self.db.try_reserve_daily_llm_call(budget)
         if not reserved:
             return LLMVerdict(
@@ -704,19 +562,13 @@ class ModerationPipeline:
             history=prior_history,
             batch=batch,
             probe_count=probe_count,
-            relax_note=relax_note,
         )
 
-    def _classify_effective_action(
-        self, verdict: LLMVerdict, run_mode: RunMode, *, relax_active: bool = False
-    ) -> str:
+    def _classify_effective_action(self, verdict: LLMVerdict, run_mode: RunMode) -> str:
         th = self.cfg.thresholds
-        spam_threshold = min(0.95, th.spam_auto_block + 0.05) if relax_active else th.spam_auto_block
-        pass_threshold = max(0.60, th.pass_auto_allow - 0.10) if relax_active else th.pass_auto_allow
-
-        if verdict.decision == DecisionType.SPAM and verdict.confidence >= spam_threshold:
+        if verdict.decision == DecisionType.SPAM and verdict.confidence >= th.spam_auto_block:
             return "auto_block" if run_mode == RunMode.AUTO else "review"
-        if verdict.decision == DecisionType.PASS and verdict.confidence >= pass_threshold:
+        if verdict.decision == DecisionType.PASS and verdict.confidence >= th.pass_auto_allow:
             return "auto_pass" if run_mode == RunMode.AUTO else "review"
         if verdict.decision == DecisionType.ASK:
             return "probe"
@@ -731,12 +583,9 @@ class ModerationPipeline:
         images: list[bytes],
         verdict: LLMVerdict,
         run_mode: RunMode,
-        relax_active: bool = False,
     ) -> None:
         if run_mode == RunMode.DRYRUN:
-            would_action = self._classify_effective_action(
-                verdict, RunMode.AUTO, relax_active=relax_active
-            )
+            would_action = self._classify_effective_action(verdict, RunMode.AUTO)
             await self.db.add_audit_log(
                 user_id=user_id,
                 decision=verdict.decision.value,
@@ -760,9 +609,7 @@ class ModerationPipeline:
             )
             return
 
-        effective_action = self._classify_effective_action(
-            verdict, run_mode, relax_active=relax_active
-        )
+        effective_action = self._classify_effective_action(verdict, run_mode)
 
         if effective_action == "auto_block":
             if not self.block_limiter.allow():
