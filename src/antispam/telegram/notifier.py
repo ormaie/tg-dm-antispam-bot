@@ -42,6 +42,7 @@ class HelperBotNotifier:
             str(settings.bot_session_path),
             settings.env.tg_api_id,
             settings.env.tg_api_hash,
+            flood_sleep_threshold=5,
         )
 
     def bind_pipeline(self, pipeline: ModerationPipeline) -> None:

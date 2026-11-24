@@ -164,11 +164,17 @@ class ModerationPipeline:
 
             run_mode = await self.get_run_mode()
             if run_mode != RunMode.DRYRUN:
-                if self.cfg.screening.auto_archive and not user.archived:
-                    await self.tg.archive_chat(user_id, True)
+                if (
+                    self.cfg.screening.auto_archive
+                    and not user.archived
+                    and await self.tg.archive_chat(user_id, True)
+                ):
                     await self.db.set_user_flags(user_id, archived=True)
-                if self.cfg.screening.auto_mute and not user.muted:
-                    await self.tg.mute_chat(user_id, True)
+                if (
+                    self.cfg.screening.auto_mute
+                    and not user.muted
+                    and await self.tg.mute_chat(user_id, True)
+                ):
                     await self.db.set_user_flags(user_id, muted=True)
 
             self._enqueue_for_debounce(msg)
@@ -240,11 +246,9 @@ class ModerationPipeline:
             )
             logger.info("Human takeover: user %s marked WHITELISTED", user_id)
 
-            if user.archived:
-                await self.tg.archive_chat(user_id, False)
+            if user.archived and await self.tg.archive_chat(user_id, False):
                 await self.db.set_user_flags(user_id, archived=False)
-            if user.muted:
-                await self.tg.mute_chat(user_id, False)
+            if user.muted and await self.tg.mute_chat(user_id, False):
                 await self.db.set_user_flags(user_id, muted=False)
 
     # ---------- Core Evaluation Logic ----------
@@ -429,12 +433,24 @@ class ModerationPipeline:
                 )
                 return
 
-            await self.tg.block_and_clean(
+            blocked_ok = await self.tg.block_and_clean(
                 user_id,
                 delete_history=self.cfg.actions.auto_block_delete_history,
                 revoke=self.cfg.actions.auto_block_revoke_both,
                 report_spam=self.cfg.actions.auto_block_report_spam,
             )
+            if not blocked_ok:
+                await self._send_to_review(
+                    user_id=user_id,
+                    profile=profile,
+                    batch=batch,
+                    images=images,
+                    verdict=verdict,
+                    run_mode=run_mode,
+                    extra_note="⚠️ Telegram 自动拉黑执行失败（接口异常或限流），未修改拦截状态，已降级为人工审核。",
+                )
+                return
+
             await self.db.update_user_status(
                 user_id,
                 UserStatus.BLOCKED,
@@ -512,6 +528,18 @@ class ModerationPipeline:
                     max_length=self.cfg.actions.max_probe_reply_chars,
                 )
             sent_msg_id = await self.tg.send_probe_reply(user_id, reply_text)
+            if sent_msg_id is None:
+                await self._send_to_review(
+                    user_id=user_id,
+                    profile=profile,
+                    batch=batch,
+                    images=images,
+                    verdict=verdict,
+                    run_mode=run_mode,
+                    extra_note="⚠️ 自动追问消息发送失败（Telegram 接口异常或限流），未扣减追问次数，已降级为人工审核。",
+                )
+                return
+
             await self.db.add_message(
                 user_id=user_id,
                 direction="out_bot",
@@ -589,13 +617,17 @@ class ModerationPipeline:
         )
 
     async def _release_chat_to_owner(self, user_id: int) -> None:
-        if self.cfg.screening.auto_archive:
-            await self.tg.archive_chat(user_id, False)
-        if self.cfg.screening.auto_mute:
-            await self.tg.mute_chat(user_id, False)
+        archived_cleared = not self.cfg.screening.auto_archive or await self.tg.archive_chat(
+            user_id, False
+        )
+        muted_cleared = not self.cfg.screening.auto_mute or await self.tg.mute_chat(user_id, False)
         if self.cfg.screening.mark_unread_on_pass:
             await self.tg.mark_unread(user_id)
-        await self.db.set_user_flags(user_id, archived=False, muted=False)
+        await self.db.set_user_flags(
+            user_id,
+            archived=False if archived_cleared else None,
+            muted=False if muted_cleared else None,
+        )
 
     # ---------- Owner Manual Controls (Helper Bot Buttons & Commands) ----------
 
@@ -610,6 +642,10 @@ class ModerationPipeline:
             self._cancel_pending(user_id)
             user = await self.db.get_user(user_id)
             was_blocked = user is not None and user.status == UserStatus.BLOCKED
+            if was_blocked:
+                unblocked = await self.tg.unblock_user(user_id)
+                if not unblocked:
+                    return "❌ 解封失败（Telegram 接口异常或限流），状态未变更，请稍后重试"
             if user is None:
                 await self.db.get_or_create_user(
                     user_id,
@@ -617,8 +653,6 @@ class ModerationPipeline:
                     username,
                     default_status=UserStatus.WHITELISTED,
                 )
-            if was_blocked:
-                await self.tg.unblock_user(user_id)
             await self._release_chat_to_owner(user_id)
             await self.db.update_user_status(
                 user_id,
@@ -646,6 +680,14 @@ class ModerationPipeline:
     ) -> str:
         async with self._lock_for(user_id):
             self._cancel_pending(user_id)
+            blocked_ok = await self.tg.block_and_clean(
+                user_id,
+                delete_history=self.cfg.actions.auto_block_delete_history,
+                revoke=self.cfg.actions.auto_block_revoke_both,
+                report_spam=report_spam,
+            )
+            if not blocked_ok:
+                return "❌ 拉黑失败（Telegram 接口异常或限流），状态未变更，请稍后重试"
             user = await self.db.get_user(user_id)
             if user is None:
                 await self.db.get_or_create_user(
@@ -654,12 +696,6 @@ class ModerationPipeline:
                     username,
                     default_status=UserStatus.BLOCKED,
                 )
-            await self.tg.block_and_clean(
-                user_id,
-                delete_history=self.cfg.actions.auto_block_delete_history,
-                revoke=self.cfg.actions.auto_block_revoke_both,
-                report_spam=report_spam,
-            )
             await self.db.update_user_status(
                 user_id,
                 UserStatus.BLOCKED,
@@ -678,7 +714,9 @@ class ModerationPipeline:
 
     async def manual_report_only(self, user_id: int) -> str:
         async with self._lock_for(user_id):
-            await self.tg.report_spam(user_id)
+            reported_ok = await self.tg.report_spam(user_id)
+            if not reported_ok:
+                return "❌ 举报失败（Telegram 接口异常或限流），请稍后重试"
             await self.db.add_audit_log(
                 user_id=user_id,
                 decision="spam",
@@ -695,6 +733,8 @@ class ModerationPipeline:
             self._cancel_pending(user_id)
             reply_text = self.cfg.llm.fallback_probe_message
             sent_msg_id = await self.tg.send_probe_reply(user_id, reply_text)
+            if sent_msg_id is None:
+                return "❌ 追问发送失败（Telegram 接口异常或限流），状态未变更"
             await self.db.add_message(
                 user_id=user_id,
                 direction="out_bot",

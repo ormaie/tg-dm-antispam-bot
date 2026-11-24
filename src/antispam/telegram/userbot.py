@@ -77,6 +77,7 @@ class UserbotClient:
             session,
             settings.env.tg_api_id,
             settings.env.tg_api_hash,
+            flood_sleep_threshold=5,
         )
 
     def bind_pipeline(self, pipeline: ModerationPipeline) -> None:
@@ -400,15 +401,9 @@ class UserbotClient:
         try:
             return await fn()
         except FloodWaitError as exc:
-            if exc.seconds <= 15:
-                logger.warning("FloodWait (%ss) on %s, sleeping and retrying once", exc.seconds, label)
-                await asyncio.sleep(exc.seconds + 1)
-                try:
-                    return await fn()
-                except Exception as retry_exc:
-                    logger.error("Retry failed on %s: %s", label, retry_exc)
-                    return None
-            logger.warning("FloodWait too long (%ss) on %s, skipping action", exc.seconds, label)
+            # Telethon internally sleeps waits <= flood_sleep_threshold (5s);
+            # anything longer fails fast so callers degrade cleanly without holding locks.
+            logger.warning("FloodWait (%ss) on %s, failing fast", exc.seconds, label)
             return None
         except RPCError as exc:
             logger.warning("Telegram RPC error on %s: %s", label, exc)
@@ -486,19 +481,20 @@ class UserbotClient:
 
         return await self._safe_rpc(f"resolve_user_id({cleaned})", _resolve)
 
-    async def archive_chat(self, user_id: int, archive: bool) -> None:
-        async def _op() -> None:
+    async def archive_chat(self, user_id: int, archive: bool) -> bool:
+        async def _op() -> bool:
             peer = await self.client.get_input_entity(user_id)
             await self.client(
                 EditPeerFoldersRequest(
                     folder_peers=[InputFolderPeer(peer=peer, folder_id=1 if archive else 0)]
                 )
             )
+            return True
 
-        await self._safe_rpc(f"archive_chat({user_id}, {archive})", _op)
+        return bool(await self._safe_rpc(f"archive_chat({user_id}, {archive})", _op))
 
-    async def mute_chat(self, user_id: int, mute: bool) -> None:
-        async def _op() -> None:
+    async def mute_chat(self, user_id: int, mute: bool) -> bool:
+        async def _op() -> bool:
             peer = await self.client.get_input_entity(user_id)
             await self.client(
                 UpdateNotifySettingsRequest(
@@ -509,17 +505,19 @@ class UserbotClient:
                     ),
                 )
             )
+            return True
 
-        await self._safe_rpc(f"mute_chat({user_id}, {mute})", _op)
+        return bool(await self._safe_rpc(f"mute_chat({user_id}, {mute})", _op))
 
-    async def mark_unread(self, user_id: int) -> None:
-        async def _op() -> None:
+    async def mark_unread(self, user_id: int) -> bool:
+        async def _op() -> bool:
             peer = await self.client.get_input_entity(user_id)
             await self.client(
                 MarkDialogUnreadRequest(peer=InputDialogPeer(peer=peer), unread=True)
             )
+            return True
 
-        await self._safe_rpc(f"mark_unread({user_id})", _op)
+        return bool(await self._safe_rpc(f"mark_unread({user_id})", _op))
 
     async def send_probe_reply(self, user_id: int, text: str) -> int | None:
         async def _op() -> int | None:
@@ -555,34 +553,54 @@ class UserbotClient:
         delete_history: bool,
         revoke: bool,
         report_spam: bool,
-    ) -> None:
-        async def _op() -> None:
-            peer = await self.client.get_input_entity(user_id)
-            if report_spam:
-                await self.client(ReportSpamRequest(peer=peer))
-            await self.client(BlockRequest(id=peer))
-            if delete_history:
-                await self.client(
+    ) -> bool:
+        peer = await self._safe_rpc(
+            f"get_input_entity({user_id})",
+            lambda: self.client.get_input_entity(user_id),
+        )
+        if peer is None:
+            return False
+
+        if report_spam:
+            # Best-effort before blocking/deleting so spam report never aborts the block itself
+            await self._safe_rpc(
+                f"report_spam({user_id})",
+                lambda: self.client(ReportSpamRequest(peer=peer)),
+            )
+
+        blocked = await self._safe_rpc(
+            f"block({user_id})",
+            lambda: self.client(BlockRequest(id=peer)),
+        )
+        if blocked is None:
+            return False
+
+        if delete_history:
+            await self._safe_rpc(
+                f"delete_history({user_id})",
+                lambda: self.client(
                     DeleteHistoryRequest(
                         peer=peer,
                         max_id=0,
                         just_clear=False,
                         revoke=revoke,
                     )
-                )
+                ),
+            )
+        return True
 
-        await self._safe_rpc(f"block_and_clean({user_id})", _op)
-
-    async def unblock_user(self, user_id: int) -> None:
-        async def _op() -> None:
+    async def unblock_user(self, user_id: int) -> bool:
+        async def _op() -> bool:
             peer = await self.client.get_input_entity(user_id)
             await self.client(UnblockRequest(id=peer))
+            return True
 
-        await self._safe_rpc(f"unblock_user({user_id})", _op)
+        return bool(await self._safe_rpc(f"unblock_user({user_id})", _op))
 
-    async def report_spam(self, user_id: int) -> None:
-        async def _op() -> None:
+    async def report_spam(self, user_id: int) -> bool:
+        async def _op() -> bool:
             peer = await self.client.get_input_entity(user_id)
             await self.client(ReportSpamRequest(peer=peer))
+            return True
 
-        await self._safe_rpc(f"report_spam({user_id})", _op)
+        return bool(await self._safe_rpc(f"report_spam({user_id})", _op))

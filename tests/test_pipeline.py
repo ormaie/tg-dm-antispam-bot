@@ -32,6 +32,10 @@ class FakeTelegramActions:
         self.blocked: list[tuple[int, bool, bool, bool]] = []
         self.unblocked: list[int] = []
         self.reported: list[int] = []
+        self.fail_block: bool = False
+        self.fail_probe: bool = False
+        self.fail_unblock: bool = False
+        self.fail_report: bool = False
         self._msg_seq = 5000
 
     async def has_owner_history(self, user_id: int, limit: int) -> bool:
@@ -45,16 +49,21 @@ class FakeTelegramActions:
     async def resolve_user_id(self, identifier: str) -> tuple[int, str, str | None] | None:
         return None
 
-    async def archive_chat(self, user_id: int, archive: bool) -> None:
+    async def archive_chat(self, user_id: int, archive: bool) -> bool:
         self.archived.append((user_id, archive))
+        return True
 
-    async def mute_chat(self, user_id: int, mute: bool) -> None:
+    async def mute_chat(self, user_id: int, mute: bool) -> bool:
         self.muted.append((user_id, mute))
+        return True
 
-    async def mark_unread(self, user_id: int) -> None:
+    async def mark_unread(self, user_id: int) -> bool:
         self.marked_unread.append(user_id)
+        return True
 
     async def send_probe_reply(self, user_id: int, text: str) -> int | None:
+        if self.fail_probe:
+            return None
         self._msg_seq += 1
         self.probes_sent.append((user_id, text))
         return self._msg_seq
@@ -66,14 +75,23 @@ class FakeTelegramActions:
         delete_history: bool,
         revoke: bool,
         report_spam: bool,
-    ) -> None:
+    ) -> bool:
+        if self.fail_block:
+            return False
         self.blocked.append((user_id, delete_history, revoke, report_spam))
+        return True
 
-    async def unblock_user(self, user_id: int) -> None:
+    async def unblock_user(self, user_id: int) -> bool:
+        if self.fail_unblock:
+            return False
         self.unblocked.append(user_id)
+        return True
 
-    async def report_spam(self, user_id: int) -> None:
+    async def report_spam(self, user_id: int) -> bool:
+        if self.fail_report:
+            return False
         self.reported.append(user_id)
+        return True
 
 
 class FakeNotifier:
@@ -663,3 +681,100 @@ async def test_owner_outgoing_never_persists_friends_or_plaintext_messages(tmp_p
 
     await pipeline.shutdown()
     await db.close()
+
+
+@pytest.mark.asyncio
+async def test_telegram_rpc_failures_degrade_to_review_without_corrupting_state(
+    tmp_path: Path,
+) -> None:
+    db = Database(tmp_path / "rpc_fail.db")
+    await db.connect()
+    tg = FakeTelegramActions()
+    notifier = FakeNotifier()
+    llm = FakeLLM(
+        [
+            LLMVerdict(
+                decision=DecisionType.SPAM,
+                confidence=0.98,
+                category="promo_ad",
+                reason="广告",
+            ),
+            LLMVerdict(
+                decision=DecisionType.ASK,
+                confidence=0.6,
+                category="unknown_intent",
+                reason="问来意",
+                reply_to_user="请问哪位？",
+            ),
+        ]
+    )
+    pipeline = ModerationPipeline(
+        cfg=_fast_cfg(RunMode.AUTO), db=db, tg=tg, notifier=notifier, llm=llm  # type: ignore[arg-type]
+    )
+
+    # 1. Auto-block fails -> must NOT mark BLOCKED or send blocked card; degrades to review
+    tg.fail_block = True
+    await pipeline.handle_incoming_message(
+        IncomingMessage(user_id=9501, tg_msg_id=1, text="广告", display_name="AdFail")
+    )
+    await asyncio.sleep(0.12)
+    u1 = await db.get_user(9501)
+    assert u1 is not None and u1.status == UserStatus.PENDING_REVIEW
+    assert len(notifier.blocked_cards) == 0
+    assert len(notifier.review_cards) == 1
+    assert "自动拉黑执行失败" in notifier.review_cards[0]["extra_note"]
+
+    # Manual block failure also leaves status unchanged
+    res_block = await pipeline.manual_block(9501)
+    assert "失败" in res_block
+    u1_after = await db.get_user(9501)
+    assert u1_after is not None and u1_after.status == UserStatus.PENDING_REVIEW
+
+    # 2. Auto-probe send fails -> must NOT increment probe_count or store out_bot message
+    tg.fail_probe = True
+    await pipeline.handle_incoming_message(
+        IncomingMessage(user_id=9502, tg_msg_id=2, text="你好", display_name="ProbeFail")
+    )
+    await asyncio.sleep(0.12)
+    u2 = await db.get_user(9502)
+    assert u2 is not None and u2.status == UserStatus.PENDING_REVIEW
+    assert u2.probe_count == 0
+    msgs2 = await db.get_recent_messages(9502)
+    assert all(m.direction != "out_bot" for m in msgs2)
+    assert "自动追问消息发送失败" in notifier.review_cards[1]["extra_note"]
+
+    # 3. Unblock failure on manual_allow leaves BLOCKED status intact
+    tg.fail_block = False
+    await pipeline.manual_block(9501)
+    tg.fail_unblock = True
+    res_unblock = await pipeline.manual_allow(9501)
+    assert "解封失败" in res_unblock
+    u1_blocked = await db.get_user(9501)
+    assert u1_blocked is not None and u1_blocked.status == UserStatus.BLOCKED
+
+    await pipeline.shutdown()
+    await db.close()
+
+
+def test_userbot_sets_explicit_flood_sleep_threshold(tmp_path: Path) -> None:
+    from antispam.config import AppConfig, EnvSettings, Settings
+    from antispam.telegram.notifier import HelperBotNotifier
+    from antispam.telegram.userbot import UserbotClient
+
+    env = EnvSettings(
+        tg_api_id=12345,
+        tg_api_hash="hash",
+        bot_token="123:abc",
+        owner_id=999,
+        llm_api_key="sk-test",
+        data_dir=tmp_path,
+    )
+    settings = Settings(env=env, cfg=AppConfig())
+    userbot = UserbotClient(settings)
+    notifier = HelperBotNotifier(settings)
+    try:
+        assert userbot.client.flood_sleep_threshold == 5
+        assert notifier.client.flood_sleep_threshold == 5
+    finally:
+        userbot.client.session.close()
+        notifier.client.session.close()
