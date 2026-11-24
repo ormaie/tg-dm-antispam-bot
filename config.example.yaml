@@ -1,0 +1,114 @@
+# 运行模式：
+# - dryrun: 演习模式，仅分析并向辅助 Bot 发建议，不自动回复、不归档、不拉黑
+# - review_only: 半自动模式，自动静音归档与追问来意，但所有放行/拉黑均由机主按钮确认
+# - auto: 全自动分级模式（高置信度广告自动拉黑删记录，中置信度推机主确认，高置信度正常人自动放行）
+# 建议首次上线先使用 review_only 或 dryrun 观察 1~2 天，确认 Prompt 准确后再通过 Bot 发 /mode auto 切换。
+mode: "review_only"
+
+screening:
+  # 防抖聚合窗口（秒）：陌生人连续发多条消息时合并送审
+  debounce_seconds: 5.0
+  # 单批次最长等待上限（秒），防止持续刷屏饿死定时器
+  max_wait_seconds: 15.0
+  # 自动询问来意的最大轮次（达到上限仍不明来意则停止回复并转人工审核）
+  max_probe_rounds: 2
+  # 审核期间自动移入归档文件夹（通过后自动移出）
+  auto_archive: true
+  # 审核期间自动静音（通过后自动取消静音）
+  auto_mute: true
+  # 审核通过移出归档时，将其标记为未读以提醒机主
+  mark_unread_on_pass: true
+  # 忽略 Bot 账号私聊
+  ignore_bots: true
+  # 首次遇到未知用户时检查最近 N 条历史，只要存在你发过的消息就自动白名单
+  history_check_limit: 10
+  # 账号资料与共同群组缓存 TTL（秒）
+  profile_cache_ttl_seconds: 1800
+  # 永久白名单（用户 ID 或不带 @ 的用户名）
+  whitelist_user_ids: []
+  whitelist_usernames: []
+
+thresholds:
+  # >= 此值判定为高置信度广告（auto 模式下直接自动拉黑并双向删记录）
+  spam_auto_block: 0.85
+  # 介于 spam_review_min 与 spam_auto_block 之间转人工审核
+  spam_review_min: 0.55
+  # >= 此值判定为高置信度正常人（auto 模式下自动放行）
+  pass_auto_allow: 0.75
+
+actions:
+  # 自动拉黑时是否删除聊天记录
+  auto_block_delete_history: true
+  # 删除聊天记录时是否双向撤回删除
+  auto_block_revoke_both: true
+  # 自动拉黑时是否顺带向 Telegram 举报垃圾信息（默认关闭，保留在辅助 Bot 按钮上人工决定）
+  auto_block_report_spam: false
+  # 自动回复前的拟人随机延迟（秒）
+  reply_delay_min_seconds: 2.0
+  reply_delay_max_seconds: 5.0
+  # 回复前模拟正在输入状态
+  simulate_typing: true
+
+rate_limit:
+  # 每分钟最多发送多少次自动回复（防群发轰炸导致账号风控）
+  max_replies_per_minute: 6
+  # 每分钟最多自动拉黑多少人
+  max_blocks_per_minute: 10
+  # 每日最大 LLM 审核调用次数，超额自动熔断转为静音归档人工审核
+  daily_llm_budget_calls: 200
+
+media:
+  # 是否启用多模态识图（图片与视频缩略图）
+  enable_vision: true
+  # 单次送审最多附带图片数量
+  max_images_per_batch: 3
+  # 发送给视觉模型前的最大边长缩放像素
+  image_max_dimension: 768
+  # JPEG 压缩质量
+  image_jpeg_quality: 75
+  # 陌生人发送以下后缀附件时标记为高危风险
+  high_risk_extensions:
+    - ".apk"
+    - ".exe"
+    - ".scr"
+    - ".bat"
+    - ".cmd"
+    - ".msi"
+    - ".vbs"
+    - ".ps1"
+    - ".lnk"
+    - ".dmg"
+    - ".iso"
+
+llm:
+  timeout_seconds: 30
+  temperature: 0.2
+  max_tokens: 500
+  # 机主背景与审核偏好（请按自己的实际情况修改，大幅提升准确率）
+  owner_context: >
+    机主平时在 Telegram 上进行日常社交、技术交流与正常项目合作。
+    放行对象：明确说明来意的朋友/熟人、共同群组里的正常群友交流、合理的技术咨询或正规商务联系。
+    重点拦截：加密货币/合约带单/U商兑换、博彩棋牌/体育盘口、色情约炮/同城空降/裸聊、
+    刷单兼职/灰产引流、代开会员/卖号/机场推广、冒充客服或美女搭讪的杀猪盘、发送可疑安装包或钓鱼链接。
+  # 自动追问的人设描述
+  assistant_persona: >
+    你是机主的私聊自动接待防广告助手。请礼貌、简明地表明身份，请对方简单说明来意（例如从哪个群找到、
+    有什么事情），并说明确认后会立刻通知机主。使用与对方相同的语言回复（若对方仅发贴纸/表情则默认中文），
+    长度控制在 1~2 句话以内，不与对方闲聊或争辩。
+  # 当模型决定追问但未生成文案时的兜底话术
+  fallback_probe_message: "你好，这是自动接待助手。为了防止广告打扰，请简单说明一下你的来意（例如从哪个群找到的、有什么事），确认后我会立刻通知机主。"
+
+# 启动时默认导入的本地前置规则（仅在数据库尚无规则时初始化，后续可用 Bot 的 /rules 指令热管理）
+default_rules:
+  - rule_type: "regex"
+    pattern: "(?i)(同城空降|约炮|裸聊|上门服务|小姐姐.*私聊)"
+    action: "spam"
+    note: "明显色情引流话术"
+  - rule_type: "regex"
+    pattern: "(?i)(稳定日赚|刷单兼职|USDT.*搬砖|合约带单|稳赚不赔|博彩|棋牌代理)"
+    action: "spam"
+    note: "明显灰产/杀猪盘/博彩推广"
+  - rule_type: "regex"
+    pattern: "(?i)(开户.*查档|社工库|代开.*会员|出售.*协议号|接码平台)"
+    action: "review"
+    note: "高风险黑灰产关键词，默认交人工复核"

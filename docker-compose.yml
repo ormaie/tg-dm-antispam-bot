@@ -1,0 +1,12 @@
+services:
+  antispam:
+    build: .
+    container_name: tg-dm-antispam-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./config.yaml:/app/config.yaml:ro
+    stdin_open: true
+    tty: true

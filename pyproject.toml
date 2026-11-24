@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=69.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tg-dm-antispam-bot"
+version = "0.1.0"
+description = "Telegram DM anti-spam userbot powered by multimodal OpenAI-compatible LLMs and a helper notification bot."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "telethon>=1.36.0,<2.0.0",
+    "openai>=1.50.0",
+    "aiosqlite>=0.20.0",
+    "pydantic>=2.7.0",
+    "pydantic-settings>=2.3.0",
+    "PyYAML>=6.0.1",
+    "Pillow>=10.3.0",
+    "python-dotenv>=1.0.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2.0",
+    "pytest-asyncio>=0.23.0",
+    "ruff>=0.5.0",
+]
+
+[project.scripts]
+antispam = "antispam.main:cli"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+ignore = ["BLE001"]
