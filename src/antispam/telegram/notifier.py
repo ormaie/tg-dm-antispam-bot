@@ -111,29 +111,14 @@ class HelperBotNotifier:
         try:
             if action in ("allow", "unblock"):
                 result = await self._pipeline.manual_allow(user_id)
-                new_buttons = [[Button.inline("🚫 改为拉黑", f"act:block:{user_id}".encode())]]
             elif action == "block":
                 result = await self._pipeline.manual_block(user_id, report_spam=False)
-                new_buttons = [
-                    [
-                        Button.inline("↩️ 误杀恢复", f"act:unblock:{user_id}".encode()),
-                        Button.inline("🚨 补点举报", f"act:report_only:{user_id}".encode()),
-                    ]
-                ]
             elif action == "report":
                 result = await self._pipeline.manual_block(user_id, report_spam=True)
-                new_buttons = [[Button.inline("↩️ 误杀恢复", f"act:unblock:{user_id}".encode())]]
             elif action == "report_only":
                 result = await self._pipeline.manual_report_only(user_id)
-                new_buttons = [[Button.inline("↩️ 误杀恢复", f"act:unblock:{user_id}".encode())]]
             elif action == "probe":
                 result = await self._pipeline.manual_probe_again(user_id)
-                new_buttons = [
-                    [
-                        Button.inline("✅ 放行", f"act:allow:{user_id}".encode()),
-                        Button.inline("🚫 拉黑+删", f"act:block:{user_id}".encode()),
-                    ]
-                ]
             else:
                 await event.answer("未知操作")
                 return
@@ -141,6 +126,10 @@ class HelperBotNotifier:
             logger.exception("Callback action %s failed for %s", action, user_id)
             await event.answer(f"执行失败：{exc}", alert=True)
             return
+
+        new_buttons = await self._buttons_for_current_state(
+            user_id, include_report_button=(action == "block" and not result.startswith("❌"))
+        )
 
         await event.answer(result)
         try:
@@ -152,6 +141,25 @@ class HelperBotNotifier:
             await event.edit(updated, parse_mode="html", buttons=new_buttons, link_preview=False)
         except Exception as exc:
             logger.debug("Could not edit card message after callback: %s", exc)
+
+    async def _buttons_for_current_state(
+        self, user_id: int, *, include_report_button: bool = False
+    ) -> list[list[Any]]:
+        assert self._pipeline is not None
+        user = await self._pipeline.db.get_user(user_id)
+        if user is not None and user.status == UserStatus.WHITELISTED:
+            return [[Button.inline("🚫 改为拉黑", f"act:block:{user_id}".encode())]]
+        if user is not None and user.status == UserStatus.BLOCKED:
+            row = [Button.inline("↩️ 误杀恢复", f"act:unblock:{user_id}".encode())]
+            if include_report_button:
+                row.append(Button.inline("🚨 补点举报", f"act:report_only:{user_id}".encode()))
+            return [row]
+        return [
+            [
+                Button.inline("✅ 放行", f"act:allow:{user_id}".encode()),
+                Button.inline("🚫 拉黑+删", f"act:block:{user_id}".encode()),
+            ]
+        ]
 
     async def _on_owner_command(self, event: events.NewMessage.Event) -> None:
         if not event.is_private or event.sender_id != self._owner_id or self._pipeline is None:

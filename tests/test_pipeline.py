@@ -778,3 +778,53 @@ def test_userbot_sets_explicit_flood_sleep_threshold(tmp_path: Path) -> None:
     finally:
         userbot.client.session.close()
         notifier.client.session.close()
+
+
+@pytest.mark.asyncio
+async def test_stale_card_buttons_cannot_reprobe_or_report_resolved_users(tmp_path: Path) -> None:
+    db = Database(tmp_path / "stale_cards.db")
+    await db.connect()
+    tg = FakeTelegramActions()
+    notifier = FakeNotifier()
+    llm = FakeLLM()
+
+    pipeline = ModerationPipeline(
+        cfg=_fast_cfg(RunMode.REVIEW_ONLY), db=db, tg=tg, notifier=notifier, llm=llm  # type: ignore[arg-type]
+    )
+
+    # 1. Unknown user cannot be probed
+    res_unknown = await pipeline.manual_probe_again(99999)
+    assert "未找到" in res_unknown
+    assert tg.probes_sent == []
+
+    # 2. Pending user can be probed cleanly
+    await pipeline.handle_incoming_message(
+        IncomingMessage(user_id=9601, tg_msg_id=1, text="你好", display_name="FriendA")
+    )
+    await asyncio.sleep(0.12)
+    res_ok = await pipeline.manual_probe_again(9601)
+    assert "已向对方发送" in res_ok
+    assert len(tg.probes_sent) == 1
+
+    # 3. Allow user -> clicking stale "probe again" or "report_only" must be rejected!
+    await pipeline.manual_allow(9601)
+    res_stale_probe = await pipeline.manual_probe_again(9601)
+    assert "已处理" in res_stale_probe
+    assert len(tg.probes_sent) == 1  # no extra message sent to whitelisted friend
+    user_after_probe = await db.get_user(9601)
+    assert user_after_probe is not None and user_after_probe.status == UserStatus.WHITELISTED
+
+    res_stale_report = await pipeline.manual_report_only(9601)
+    assert "已放行加白" in res_stale_report
+    assert tg.reported == []
+
+    # 4. Blocked user -> clicking stale "probe again" must also be rejected!
+    await pipeline.manual_block(9601)
+    res_blocked_probe = await pipeline.manual_probe_again(9601)
+    assert "已处理" in res_blocked_probe
+    assert len(tg.probes_sent) == 1
+    user_after_block = await db.get_user(9601)
+    assert user_after_block is not None and user_after_block.status == UserStatus.BLOCKED
+
+    await pipeline.shutdown()
+    await db.close()

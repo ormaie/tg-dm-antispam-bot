@@ -714,6 +714,9 @@ class ModerationPipeline:
 
     async def manual_report_only(self, user_id: int) -> str:
         async with self._lock_for(user_id):
+            user = await self.db.get_user(user_id)
+            if user is not None and user.status == UserStatus.WHITELISTED:
+                return "ℹ️ 该用户当前已放行加白，已忽略旧卡片举报操作"
             reported_ok = await self.tg.report_spam(user_id)
             if not reported_ok:
                 return "❌ 举报失败（Telegram 接口异常或限流），请稍后重试"
@@ -730,6 +733,17 @@ class ModerationPipeline:
 
     async def manual_probe_again(self, user_id: int) -> str:
         async with self._lock_for(user_id):
+            user = await self.db.get_user(user_id)
+            if user is None:
+                return "ℹ️ 未找到该用户的审核记录，无法追问"
+            if user.status not in (
+                UserStatus.NEW,
+                UserStatus.PROBING,
+                UserStatus.PENDING_REVIEW,
+            ):
+                status_label = "已放行加白" if user.status == UserStatus.WHITELISTED else "已拉黑"
+                return f"ℹ️ 该用户已处理（当前状态：{status_label}），无法再追问"
+
             self._cancel_pending(user_id)
             reply_text = self.cfg.llm.fallback_probe_message
             sent_msg_id = await self.tg.send_probe_reply(user_id, reply_text)
