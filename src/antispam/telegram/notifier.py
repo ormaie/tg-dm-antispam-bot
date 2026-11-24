@@ -392,9 +392,26 @@ class HelperBotNotifier:
             chats = "未知"
             flag_str = ""
 
+        p_channel_line = ""
+        if profile and (
+            profile.personal_channel_title
+            or profile.personal_channel_username
+            or profile.personal_channel_about
+        ):
+            parts = []
+            if profile.personal_channel_title:
+                parts.append(profile.personal_channel_title)
+            if profile.personal_channel_username:
+                parts.append(f"@{profile.personal_channel_username}")
+            if profile.personal_channel_about:
+                parts.append(_truncate(profile.personal_channel_about, 100))
+            p_channel_line = f"📢 <b>个人频道</b>：{_esc(' · '.join(parts))}\n"
+
         msg_lines: list[str] = []
         for msg in batch[:6]:
             segs: list[str] = []
+            if msg.is_edited:
+                segs.append("[✏️已编辑]")
             if msg.forward_source:
                 segs.append(f"[转发: {_esc(msg.forward_source)}]")
             if msg.text:
@@ -414,6 +431,7 @@ class HelperBotNotifier:
             f"👤 <b>用户</b>：{_esc(name)}{_esc(flag_str)}\n"
             f"🆔 <b>ID / 用户名</b>：<code>{user_id}</code> / {_esc(username)}\n"
             f"📝 <b>Bio</b>：{_esc(bio)}\n"
+            f"{p_channel_line}"
             f"👥 <b>共同群</b>：{_esc(chats)}\n"
             f"💬 <b>消息快照</b>：\n" + "\n".join(msg_lines)
         )
@@ -575,12 +593,13 @@ class HelperBotNotifier:
         message: IncomingMessage,
     ) -> None:
         uname = f" (@{_esc(username)})" if username else ""
+        edit_prefix = "[✏️已编辑] " if message.is_edited else ""
         content = _esc(_truncate(message.text, 250)) if message.text else ""
         media_note = f" [{_esc(message.media.description)}]" if message.media else ""
         text = (
             f"💬 <b>待审核对象补充消息</b>\n"
             f"👤 {_esc(display_name)}{uname} (<code>{user_id}</code>)\n"
-            f"• {content}{media_note}"
+            f"• {edit_prefix}{content}{media_note}"
         )
         buttons = [
             [

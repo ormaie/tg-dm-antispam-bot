@@ -39,7 +39,8 @@ CREATE TABLE IF NOT EXISTS users (
     last_confidence REAL,
     last_reason TEXT,
     first_seen_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    auto_passed_at TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_users_status ON users(status);
@@ -112,7 +113,14 @@ class Database:
         await self._conn.execute("PRAGMA busy_timeout=5000;")
         await self._conn.execute("PRAGMA foreign_keys=ON;")
         await self._conn.executescript(SCHEMA_SQL)
+        await self._ensure_migrations()
         await self._conn.commit()
+
+    async def _ensure_migrations(self) -> None:
+        async with self.conn.execute("PRAGMA table_info(users)") as cur:
+            cols = {row["name"] for row in await cur.fetchall()}
+        if "auto_passed_at" not in cols:
+            await self.conn.execute("ALTER TABLE users ADD COLUMN auto_passed_at TEXT")
 
     async def close(self) -> None:
         if self._conn is not None:
@@ -136,6 +144,7 @@ class Database:
             last_reason=row["last_reason"],
             first_seen_at=row["first_seen_at"],
             updated_at=row["updated_at"],
+            auto_passed_at=row["auto_passed_at"],
         )
 
     async def _get_user_unlocked(self, user_id: int) -> StoredUser | None:
@@ -192,6 +201,8 @@ class Database:
         confidence: float | None = None,
         reason: str | None = None,
         reset_probes: bool = False,
+        auto_passed_at: str | None = None,
+        clear_auto_passed: bool = False,
     ) -> None:
         now = utc_now_iso()
         fields = ["status = ?", "updated_at = ?"]
@@ -207,6 +218,11 @@ class Database:
             params.append(reason)
         if reset_probes:
             fields.append("probe_count = 0")
+        if auto_passed_at is not None:
+            fields.append("auto_passed_at = ?")
+            params.append(auto_passed_at)
+        elif clear_auto_passed:
+            fields.append("auto_passed_at = NULL")
         params.append(user_id)
         async with self._lock:
             await self.conn.execute(

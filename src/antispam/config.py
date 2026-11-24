@@ -21,6 +21,7 @@ class ScreeningConfig(BaseModel):
     ignore_bots: bool = True
     history_check_limit: int = Field(default=10, ge=1, le=50)
     profile_cache_ttl_seconds: int = Field(default=1800, ge=60)
+    edit_probation_minutes: int = Field(default=30, ge=0, le=1440)
     whitelist_user_ids: list[int] = Field(default_factory=list)
     whitelist_usernames: list[str] = Field(default_factory=list)
 

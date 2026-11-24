@@ -61,6 +61,10 @@ class RuleEngine:
                 targets.append(("display_name", profile.display_name))
             if profile.bio:
                 targets.append(("bio", profile.bio))
+            if profile.personal_channel_title:
+                targets.append(("personal_channel_title", profile.personal_channel_title))
+            if profile.personal_channel_about:
+                targets.append(("personal_channel_about", profile.personal_channel_about))
         for msg in messages:
             if msg.text:
                 targets.append(("message", msg.text))

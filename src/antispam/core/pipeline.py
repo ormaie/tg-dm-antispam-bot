@@ -4,6 +4,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 
 from antispam.config import AppConfig
 from antispam.core.enricher import ProfileEnricher
@@ -19,7 +20,7 @@ from antispam.models import (
     UserProfile,
     UserStatus,
 )
-from antispam.storage.db import Database
+from antispam.storage.db import Database, utc_now_iso
 
 logger = logging.getLogger(__name__)
 
@@ -216,6 +217,84 @@ class ModerationPipeline:
                 pending.timer_task.cancel()
             await self._process_batch_locked(user_id, pending.messages)
 
+    def _is_within_edit_probation(self, auto_passed_at: str | None) -> bool:
+        probation_minutes = self.cfg.screening.edit_probation_minutes
+        if probation_minutes <= 0 or not auto_passed_at:
+            return False
+        try:
+            passed_dt = datetime.fromisoformat(auto_passed_at)
+            if passed_dt.tzinfo is None:
+                passed_dt = passed_dt.replace(tzinfo=UTC)
+        except ValueError:
+            return False
+        elapsed_seconds = (datetime.now(UTC) - passed_dt).total_seconds()
+        return 0 <= elapsed_seconds <= probation_minutes * 60
+
+    async def handle_edited_message(self, msg: IncomingMessage) -> None:
+        """Re-evaluate edited messages during screening or post-auto-pass probation."""
+        user_id = msg.user_id
+        if self._is_static_whitelisted(user_id, msg.username):
+            return
+
+        async with self._lock_for(user_id):
+            user = await self.db.get_user(user_id)
+            if user is None or user.status == UserStatus.BLOCKED:
+                return
+
+            if user.status == UserStatus.WHITELISTED:
+                if not self._is_within_edit_probation(user.auto_passed_at):
+                    return
+                logger.info(
+                    "Auto-passed user %s edited a message within probation window; re-screening",
+                    user_id,
+                )
+                await self.db.update_user_status(
+                    user_id,
+                    UserStatus.PROBING,
+                    reason="自动放行观察期内编辑消息，重新触发审核",
+                    clear_auto_passed=True,
+                )
+                user = await self.db.get_user(user_id)
+                assert user is not None
+
+            meta = msg.media.to_meta_dict() if msg.media else {}
+            meta["edited"] = True
+            await self.db.add_message(
+                user_id=user_id,
+                direction="in",
+                text=msg.text,
+                tg_msg_id=msg.tg_msg_id,
+                media_type=msg.media.media_type if msg.media else None,
+                media_meta=meta,
+            )
+
+            if user.status == UserStatus.PENDING_REVIEW:
+                await self.notifier.send_pending_followup(
+                    user_id=user_id,
+                    display_name=msg.display_name,
+                    username=msg.username,
+                    message=msg,
+                )
+                return
+
+            self.enricher.invalidate(user_id)
+            run_mode = await self.get_run_mode()
+            if run_mode != RunMode.DRYRUN:
+                if (
+                    self.cfg.screening.auto_archive
+                    and not user.archived
+                    and await self.tg.archive_chat(user_id, True)
+                ):
+                    await self.db.set_user_flags(user_id, archived=True)
+                if (
+                    self.cfg.screening.auto_mute
+                    and not user.muted
+                    and await self.tg.mute_chat(user_id, True)
+                ):
+                    await self.db.set_user_flags(user_id, muted=True)
+
+            self._enqueue_for_debounce(msg)
+
     # ---------- Human Takeover ----------
 
     async def handle_owner_outgoing(
@@ -243,6 +322,7 @@ class ModerationPipeline:
                 user_id,
                 UserStatus.WHITELISTED,
                 reason="机主已手动回复接管对话",
+                clear_auto_passed=True,
             )
             logger.info("Human takeover: user %s marked WHITELISTED", user_id)
 
@@ -486,6 +566,7 @@ class ModerationPipeline:
                 category=verdict.category,
                 confidence=verdict.confidence,
                 reason=verdict.reason,
+                auto_passed_at=utc_now_iso(),
             )
             await self.db.add_audit_log(
                 user_id=user_id,
@@ -658,6 +739,7 @@ class ModerationPipeline:
                 user_id,
                 UserStatus.WHITELISTED,
                 reason="机主手动放行/加白",
+                clear_auto_passed=True,
             )
             await self.db.add_audit_log(
                 user_id=user_id,

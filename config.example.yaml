@@ -24,6 +24,8 @@ screening:
   history_check_limit: 10
   # 账号资料与共同群组缓存 TTL（秒）
   profile_cache_ttl_seconds: 1800
+  # AI 自动放行后的消息编辑观察期（分钟）：期间若对方编辑消息将重新复审，防先打招呼后改成广告（0 表示关闭）
+  edit_probation_minutes: 30
   # 永久白名单（用户 ID 或不带 @ 的用户名）
   whitelist_user_ids: []
   whitelist_usernames: []

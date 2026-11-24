@@ -828,3 +828,74 @@ async def test_stale_card_buttons_cannot_reprobe_or_report_resolved_users(tmp_pa
 
     await pipeline.shutdown()
     await db.close()
+
+
+@pytest.mark.asyncio
+async def test_edited_message_catches_bait_and_switch_during_probation(tmp_path: Path) -> None:
+    db = Database(tmp_path / "edit_probation.db")
+    await db.connect()
+    tg = FakeTelegramActions()
+    notifier = FakeNotifier()
+    llm = FakeLLM(
+        [
+            LLMVerdict(
+                decision=DecisionType.PASS,
+                confidence=0.92,
+                category="normal",
+                reason="自称群友请教问题",
+            ),
+            LLMVerdict(
+                decision=DecisionType.SPAM,
+                confidence=0.97,
+                category="promo_ad",
+                reason="放行后立刻编辑原消息为博彩广告链接",
+            ),
+        ]
+    )
+
+    pipeline = ModerationPipeline(
+        cfg=_fast_cfg(RunMode.AUTO), db=db, tg=tg, notifier=notifier, llm=llm  # type: ignore[arg-type]
+    )
+
+    # 1. Stranger passes initial screening -> WHITELISTED with auto_passed_at set
+    await pipeline.handle_incoming_message(
+        IncomingMessage(user_id=9701, tg_msg_id=10, text="我在群里看到你的项目想请教", display_name="Bait")
+    )
+    await asyncio.sleep(0.12)
+    u = await db.get_user(9701)
+    assert u is not None and u.status == UserStatus.WHITELISTED and u.auto_passed_at is not None
+
+    # 2. Stranger edits message to spam within probation window -> re-screened & auto-blocked!
+    await pipeline.handle_edited_message(
+        IncomingMessage(
+            user_id=9701,
+            tg_msg_id=10,
+            text="澳门赌场高返水点击链接",
+            display_name="Bait",
+            is_edited=True,
+        )
+    )
+    await asyncio.sleep(0.12)
+    u_after = await db.get_user(9701)
+    assert u_after is not None and u_after.status == UserStatus.BLOCKED
+    assert len(tg.blocked) == 1
+    assert len(notifier.blocked_cards) == 1
+
+    # 3. Manually whitelisted friend (auto_passed_at=None) editing a typo must NOT trigger LLM
+    await pipeline.manual_allow(9702, display_name="RealFriend")
+    await pipeline.handle_edited_message(
+        IncomingMessage(
+            user_id=9702,
+            tg_msg_id=20,
+            text="修正一个错别字",
+            display_name="RealFriend",
+            is_edited=True,
+        )
+    )
+    await asyncio.sleep(0.12)
+    assert len(llm.calls) == 2  # still only the 2 calls for 9701
+    friend = await db.get_user(9702)
+    assert friend is not None and friend.status == UserStatus.WHITELISTED
+
+    await pipeline.shutdown()
+    await db.close()

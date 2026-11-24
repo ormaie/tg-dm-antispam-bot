@@ -47,6 +47,25 @@ def test_rule_engine_matches_bio_and_forward_source() -> None:
     assert match.action == "review"
 
 
+def test_rule_engine_matches_personal_channel_title_and_about() -> None:
+    engine = RuleEngine()
+    rules = [
+        LocalRule(1, "keyword", "合约带单", "spam", "个人频道推广", True, "2026-01-01"),
+    ]
+    profile = UserProfile(
+        user_id=102,
+        first_name="普通人",
+        bio="",
+        personal_channel_title="VIP 交流",
+        personal_channel_about="专注加密货币合约带单，私聊进群",
+    )
+    msg = IncomingMessage(user_id=102, tg_msg_id=3, text="你好", display_name="普通人")
+    match = engine.evaluate(rules, profile, [msg])
+    assert match is not None
+    assert match.matched_in == "personal_channel_about"
+    assert match.action == "spam"
+
+
 def test_rule_engine_validate_pattern() -> None:
     assert RuleEngine.validate_pattern("keyword", "推广") is None
     assert RuleEngine.validate_pattern("regex", r"(?i)spam\d+") is None

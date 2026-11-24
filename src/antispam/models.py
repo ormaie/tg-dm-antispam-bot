@@ -46,6 +46,9 @@ class UserProfile:
     last_name: str = ""
     username: str | None = None
     bio: str = ""
+    personal_channel_title: str = ""
+    personal_channel_username: str | None = None
+    personal_channel_about: str = ""
     is_premium: bool = False
     is_verified: bool = False
     is_scam: bool = False
@@ -95,6 +98,7 @@ class IncomingMessage:
     username: str | None = None
     forward_source: str | None = None
     media: MediaItem | None = None
+    is_edited: bool = False
     timestamp: float = 0.0
 
 
@@ -112,6 +116,7 @@ class StoredUser:
     last_reason: str | None
     first_seen_at: str
     updated_at: str
+    auto_passed_at: str | None = None
 
 
 @dataclass(slots=True)

@@ -11,6 +11,7 @@ from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError, RPCError
 from telethon.sessions import StringSession
 from telethon.tl.functions.account import UpdateNotifySettingsRequest
+from telethon.tl.functions.channels import GetFullChannelRequest
 from telethon.tl.functions.contacts import BlockRequest, UnblockRequest
 from telethon.tl.functions.folders import EditPeerFoldersRequest
 from telethon.tl.functions.messages import (
@@ -21,6 +22,7 @@ from telethon.tl.functions.messages import (
 )
 from telethon.tl.functions.users import GetFullUserRequest
 from telethon.tl.types import (
+    Channel,
     DocumentAttributeAudio,
     DocumentAttributeFilename,
     DocumentAttributeSticker,
@@ -128,6 +130,10 @@ class UserbotClient:
             events.NewMessage(incoming=True),
         )
         self.client.add_event_handler(
+            self._on_edited_dm,
+            events.MessageEdited(incoming=True),
+        )
+        self.client.add_event_handler(
             self._on_outgoing_dm,
             events.NewMessage(outgoing=True),
         )
@@ -148,26 +154,26 @@ class UserbotClient:
             return True
         return self._helper_bot_id is not None and peer_id == self._helper_bot_id
 
-    async def _on_incoming_dm(self, event: events.NewMessage.Event) -> None:
-        if self._pipeline is None or not event.is_private:
-            return
+    async def _build_incoming_from_event(
+        self, event: Any, *, is_edited: bool
+    ) -> IncomingMessage | None:
+        if not event.is_private:
+            return None
         sender_id = event.sender_id
         if not sender_id or self._should_ignore_peer_id(sender_id):
-            return
+            return None
 
         sender = await event.get_sender()
         if not isinstance(sender, User):
-            return
-        if sender.is_self or sender.deleted or sender.support:
-            return
-        if sender.contact:
-            return
+            return None
+        if sender.is_self or sender.deleted or sender.support or sender.contact:
+            return None
         if self._cfg.screening.ignore_bots and sender.bot:
-            return
+            return None
 
         forward_source = await self._extract_forward_source(event.message)
         media_item = await self._extract_media(event.message)
-        incoming = IncomingMessage(
+        return IncomingMessage(
             user_id=sender.id,
             tg_msg_id=event.id,
             text=(event.raw_text or "").strip(),
@@ -175,9 +181,23 @@ class UserbotClient:
             username=sender.username,
             forward_source=forward_source,
             media=media_item,
+            is_edited=is_edited,
             timestamp=event.date.timestamp() if event.date else time.time(),
         )
-        await self._pipeline.handle_incoming_message(incoming)
+
+    async def _on_incoming_dm(self, event: events.NewMessage.Event) -> None:
+        if self._pipeline is None:
+            return
+        incoming = await self._build_incoming_from_event(event, is_edited=False)
+        if incoming is not None:
+            await self._pipeline.handle_incoming_message(incoming)
+
+    async def _on_edited_dm(self, event: events.MessageEdited.Event) -> None:
+        if self._pipeline is None:
+            return
+        edited = await self._build_incoming_from_event(event, is_edited=True)
+        if edited is not None:
+            await self._pipeline.handle_edited_message(edited)
 
     async def _on_outgoing_dm(self, event: events.NewMessage.Event) -> None:
         if self._pipeline is None or not event.is_private:
@@ -439,6 +459,41 @@ class UserbotClient:
                 return None
 
             bio = getattr(full_res.full_user, "about", None) or ""
+            p_title = ""
+            p_username: str | None = None
+            p_about = ""
+            personal_channel_id = getattr(full_res.full_user, "personal_channel_id", None)
+            if personal_channel_id:
+                p_channel: Channel | None = None
+                for ch in getattr(full_res, "chats", []) or []:
+                    if isinstance(ch, Channel) and ch.id == personal_channel_id:
+                        p_channel = ch
+                        break
+                if p_channel is None:
+                    try:
+                        ent = await self.client.get_entity(personal_channel_id)
+                        if isinstance(ent, Channel):
+                            p_channel = ent
+                    except Exception as exc:
+                        logger.debug(
+                            "Could not resolve personal channel %s for %s: %s",
+                            personal_channel_id,
+                            user_id,
+                            exc,
+                        )
+                if p_channel is not None:
+                    p_title = p_channel.title or ""
+                    p_username = p_channel.username
+                    try:
+                        ch_full = await self.client(GetFullChannelRequest(p_channel))
+                        p_about = getattr(ch_full.full_chat, "about", None) or ""
+                    except Exception as exc:
+                        logger.debug(
+                            "GetFullChannel failed for personal channel %s: %s",
+                            personal_channel_id,
+                            exc,
+                        )
+
             common_titles: list[str] = []
             try:
                 common_res = await self.client(
@@ -457,6 +512,9 @@ class UserbotClient:
                 last_name=user_obj.last_name or "",
                 username=user_obj.username,
                 bio=bio,
+                personal_channel_title=p_title,
+                personal_channel_username=p_username,
+                personal_channel_about=p_about,
                 is_premium=bool(getattr(user_obj, "premium", False)),
                 is_verified=bool(getattr(user_obj, "verified", False)),
                 is_scam=bool(getattr(user_obj, "scam", False)),
