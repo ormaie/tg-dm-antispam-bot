@@ -10,6 +10,7 @@ from telethon.extensions import html as tg_html
 from telethon.tl.types import User
 
 from antispam.config import Settings
+from antispam.core.pipeline import format_remaining, parse_duration_seconds
 from antispam.core.rules import RuleEngine
 from antispam.models import IncomingMessage, LLMVerdict, RunMode, UserProfile, UserStatus
 
@@ -178,6 +179,16 @@ class HelperBotNotifier:
             await self._cmd_status(event)
         elif cmd == "/mode":
             await self._cmd_mode(event, args)
+        elif cmd == "/relax":
+            await self._cmd_relax(event, args)
+        elif cmd == "/lockdown":
+            await self._cmd_lockdown(event, args)
+        elif cmd == "/budget":
+            await self._cmd_budget(event, args)
+        elif cmd == "/reset_user":
+            await self._cmd_reset_user(event, args)
+        elif cmd == "/whitelist":
+            await self._cmd_whitelist(event, args)
         elif cmd == "/allow":
             await self._cmd_allow(event, args)
         elif cmd == "/block":
@@ -195,14 +206,16 @@ class HelperBotNotifier:
         reply = (
             "🛡️ <b>TG 私聊防广告管理指令</b>\n\n"
             f"当前模式：<code>{mode.value}</code>\n\n"
-            "• /status — 查看运行状态、今日拦截统计与 LLM 预算\n"
+            "• /status — 查看运行状态、今日统计与场景模式\n"
             "• /mode <code>dryrun|review_only|auto</code> — 实时切换运行模式\n"
-            "• /allow <code>&lt;user_id|@username&gt;</code> — 手动放行/解封并加白\n"
-            "• /block <code>&lt;user_id|@username&gt;</code> — 手动拉黑并双向删记录\n"
+            "• /relax <code>2h [场景说明]</code> | <code>off</code> — 临时放宽并注入场景背景\n"
+            "• /lockdown <code>2h</code> | <code>off</code> — 临时锁门防轰炸（只静音归档，不调 LLM）\n"
+            "• /budget <code>[次数|reset]</code> — 查看或热改每日 LLM 调用上限\n"
+            "• /allow <code>&lt;id|@user&gt;</code> / /block <code>&lt;id|@user&gt;</code> — 手动放行或拉黑\n"
+            "• /whitelist <code>[list|add|del]</code> — 管理白名单\n"
+            "• /reset_user <code>&lt;id|@user&gt;</code> — 清空单人记录方便重测\n"
             "• /pending — 列出待人工确认的陌生人\n"
-            "• /rules list — 查看本地前置拦截规则\n"
-            "• /rules add <code>keyword|regex</code> <code>spam|review</code> <code>规则内容</code> — 新增规则\n"
-            "• /rules del <code>&lt;id&gt;</code> — 删除规则"
+            "• /rules <code>list|add|del</code> — 热管理本地前置拦截规则"
         )
         await event.reply(reply, parse_mode="html")
 
@@ -210,10 +223,21 @@ class HelperBotNotifier:
         assert self._pipeline is not None
         mode = await self._pipeline.get_run_mode()
         stats = await self._pipeline.db.get_today_stats()
-        budget = self._settings.cfg.rate_limit.daily_llm_budget_calls
+        budget = await self._pipeline.get_effective_daily_budget()
+        relax = await self._pipeline.get_relax_state()
+        lockdown = await self._pipeline.get_lockdown_state()
+
+        temp_line = "• 临时场景：无\n"
+        if lockdown:
+            temp_line = f"• 🔒 <b>锁门模式生效中</b>：剩余 {format_remaining(lockdown['remaining_seconds'])}\n"
+        elif relax:
+            note = f"（{_esc(relax['note'])}）" if relax.get("note") else ""
+            temp_line = f"• 🌿 <b>临时放宽生效中</b>：剩余 {format_remaining(relax['remaining_seconds'])}{note}\n"
+
         reply = (
             "📊 <b>今日运行状态（UTC）</b>\n\n"
             f"• 运行模式：<code>{mode.value}</code>\n"
+            f"{temp_line}"
             f"• 当前待人工审核：<b>{stats['pending_now']}</b> 人\n"
             f"• 今日自动/手动拦截：<b>{stats['blocked']}</b> 次\n"
             f"• 今日放行通过：<b>{stats['passed']}</b> 次\n"
@@ -223,6 +247,172 @@ class HelperBotNotifier:
             f"• 当前分钟剩余配额：回复 {self._pipeline.reply_limiter.remaining()} / 拉黑 {self._pipeline.block_limiter.remaining()}"
         )
         await event.reply(reply, parse_mode="html")
+
+    async def _cmd_relax(self, event: events.NewMessage.Event, args: list[str]) -> None:
+        assert self._pipeline is not None
+        if not args:
+            state = await self._pipeline.get_relax_state()
+            if not state:
+                await event.reply(
+                    "当前未开启临时放宽模式。\n用法：<code>/relax 2h 刚在某群发了招聘</code> 或 <code>/relax off</code>",
+                    parse_mode="html",
+                )
+            else:
+                note = _esc(state.get("note") or "无备注")
+                await event.reply(
+                    f"🌿 <b>临时放宽生效中</b>\n• 剩余时长：{format_remaining(state['remaining_seconds'])}\n• 场景说明：{note}",
+                    parse_mode="html",
+                )
+            return
+
+        if args[0].lower() in ("off", "stop", "cancel", "0"):
+            await self._pipeline.clear_relax()
+            await event.reply("✅ 已关闭临时放宽模式，恢复正常阈值。")
+            return
+
+        duration = parse_duration_seconds(args[0])
+        if duration is None:
+            await event.reply("无效时长，支持如 <code>30m</code>、<code>2h</code>、<code>1d</code>（范围 5 分钟 ~ 7 天）。", parse_mode="html")
+            return
+        note = " ".join(args[1:]).strip()
+        state = await self._pipeline.set_relax(duration, note)
+        note_desc = f"\n• 场景说明：{_esc(note)}" if note else ""
+        await event.reply(
+            f"🌿 已开启临时放宽模式（{format_remaining(state['remaining_seconds'])}）{note_desc}\n"
+            "已适度放宽正常放行阈值并注入场景上下文（明显诈骗/注入仍会拦截）。",
+            parse_mode="html",
+        )
+
+    async def _cmd_lockdown(self, event: events.NewMessage.Event, args: list[str]) -> None:
+        assert self._pipeline is not None
+        if not args:
+            state = await self._pipeline.get_lockdown_state()
+            if not state:
+                await event.reply(
+                    "当前未开启锁门防轰炸模式。\n用法：<code>/lockdown 2h</code> 或 <code>/lockdown off</code>",
+                    parse_mode="html",
+                )
+            else:
+                await event.reply(
+                    f"🔒 <b>锁门模式生效中</b>（剩余 {format_remaining(state['remaining_seconds'])}）\n新陌生私聊仅静音归档暂存，不调用 LLM 也不自动回复。",
+                    parse_mode="html",
+                )
+            return
+
+        if args[0].lower() in ("off", "stop", "cancel", "0"):
+            await self._pipeline.clear_lockdown()
+            await event.reply("✅ 已解除锁门模式，恢复正常审核（可发送 /pending 查看暂存消息）。")
+            return
+
+        duration = parse_duration_seconds(args[0])
+        if duration is None:
+            await event.reply("无效时长，支持如 <code>30m</code>、<code>2h</code>、<code>1d</code>（范围 5 分钟 ~ 7 天）。", parse_mode="html")
+            return
+        state = await self._pipeline.set_lockdown(duration)
+        await event.reply(
+            f"🔒 已开启锁门防轰炸模式（{format_remaining(state['remaining_seconds'])}）\n"
+            "期间所有新陌生私聊将直接静音归档并转入 /pending，不调用 LLM 也不发送回复。",
+            parse_mode="html",
+        )
+
+    async def _cmd_budget(self, event: events.NewMessage.Event, args: list[str]) -> None:
+        assert self._pipeline is not None
+        used = await self._pipeline.db.get_daily_llm_calls()
+        if not args:
+            budget = await self._pipeline.get_effective_daily_budget()
+            default_b = self._settings.cfg.rate_limit.daily_llm_budget_calls
+            await event.reply(
+                f"💰 今日 LLM 调用：<b>{used}</b> / <b>{budget}</b>（配置文件默认：{default_b}）\n"
+                "用法：<code>/budget 500</code> 或 <code>/budget reset</code>",
+                parse_mode="html",
+            )
+            return
+        if args[0].lower() == "reset":
+            effective = await self._pipeline.set_daily_budget_override(None)
+            await event.reply(f"✅ 已恢复为配置文件默认限额：<b>{effective}</b> 次/天。", parse_mode="html")
+            return
+        if not args[0].isdigit():
+            await event.reply("用法：/budget <整数次数> 或 /budget reset")
+            return
+        val = int(args[0])
+        if val < 1 or val > 100000:
+            await event.reply("限额范围须在 1 ~ 100000 之间。")
+            return
+        effective = await self._pipeline.set_daily_budget_override(val)
+        await event.reply(
+            f"✅ 已将每日 LLM 调用上限热更新为 <b>{effective}</b> 次（今日已用 {used} 次）。",
+            parse_mode="html",
+        )
+
+    async def _cmd_reset_user(self, event: events.NewMessage.Event, args: list[str]) -> None:
+        assert self._pipeline is not None
+        if not args:
+            await event.reply("用法：/reset_user <user_id|@username>")
+            return
+        resolved = await self._resolve_target(args[0])
+        if not resolved:
+            await event.reply(f"无法解析用户：{_esc(args[0])}", parse_mode="html")
+            return
+        uid, name, _ = resolved
+        existed = await self._pipeline.reset_user(uid)
+        if existed:
+            await event.reply(
+                f"🔄 已重置用户 {_esc(name)} (<code>{uid}</code>) 的状态与临时消息，下次私聊将按全新陌生人重新审核。",
+                parse_mode="html",
+            )
+        else:
+            await event.reply(
+                f"ℹ️ 数据库中未找到用户 {_esc(name)} (<code>{uid}</code>) 的记录。",
+                parse_mode="html",
+            )
+
+    async def _cmd_whitelist(self, event: events.NewMessage.Event, args: list[str]) -> None:
+        assert self._pipeline is not None
+        sub = args[0].lower() if args else "list"
+        if sub == "list":
+            users = await self._pipeline.db.list_users_by_status(UserStatus.WHITELISTED, limit=30)
+            static_cnt = len(self._settings.cfg.screening.whitelist_user_ids) + len(
+                self._settings.cfg.screening.whitelist_usernames
+            )
+            if not users:
+                await event.reply(f"当前数据库白名单为空（静态配置白名单：{static_cnt} 项）。")
+                return
+            lines = [f"✅ <b>数据库白名单（最近 {len(users)} 人，静态配置 {static_cnt} 项）</b>\n"]
+            for u in users:
+                uname = f" (@{_esc(u.username)})" if u.username else ""
+                lines.append(f"• {_esc(u.display_name)}{uname} — <code>{u.user_id}</code>")
+            lines.append("\n移出示例：<code>/whitelist del &lt;id|@user&gt;</code>")
+            await event.reply("\n".join(lines), parse_mode="html")
+            return
+
+        if sub == "add":
+            await self._cmd_allow(event, args[1:])
+            return
+
+        if sub == "del":
+            if len(args) < 2:
+                await event.reply("用法：/whitelist del <user_id|@username>")
+                return
+            resolved = await self._resolve_target(args[1])
+            if not resolved:
+                await event.reply(f"无法解析用户：{_esc(args[1])}", parse_mode="html")
+                return
+            uid, name, username = resolved
+            removed, in_static = await self._pipeline.remove_from_whitelist(uid, username)
+            note = "（⚠️ 注意：该用户同时存在于 config.yaml 静态白名单中，需手动修改配置才会彻底生效）" if in_static else ""
+            if removed:
+                await event.reply(
+                    f"✅ 已将 {_esc(name)} (<code>{uid}</code>) 移出数据库白名单。{note}",
+                    parse_mode="html",
+                )
+            else:
+                await event.reply(
+                    f"ℹ️ 用户 {_esc(name)} (<code>{uid}</code>) 不在数据库白名单中。{note}",
+                    parse_mode="html",
+                )
+            return
+
+        await event.reply("用法：/whitelist list | /whitelist add <id|@user> | /whitelist del <id|@user>")
 
     async def _cmd_mode(self, event: events.NewMessage.Event, args: list[str]) -> None:
         assert self._pipeline is not None

@@ -275,6 +275,14 @@ class Database:
             rows = await cur.fetchall()
             return [self._row_to_user(row) for row in rows]
 
+    async def delete_user_and_messages(self, user_id: int) -> bool:
+        async with self._lock:
+            await self.conn.execute("DELETE FROM messages WHERE user_id = ?", (user_id,))
+            async with self.conn.execute("DELETE FROM users WHERE user_id = ?", (user_id,)) as cur:
+                deleted = cur.rowcount > 0
+            await self.conn.commit()
+            return deleted
+
     # ---------- Messages ----------
 
     async def add_message(
@@ -484,6 +492,52 @@ class Database:
                 (key, value),
             )
             await self.conn.commit()
+
+    async def delete_runtime_state(self, key: str) -> None:
+        async with self._lock:
+            await self.conn.execute("DELETE FROM runtime_state WHERE key = ?", (key,))
+            await self.conn.commit()
+
+    async def get_daily_budget_override(self) -> int | None:
+        raw = await self.get_runtime_state("daily_llm_budget_override")
+        if raw is None:
+            return None
+        try:
+            val = int(raw)
+            return val if val >= 1 else None
+        except ValueError:
+            return None
+
+    async def set_daily_budget_override(self, budget: int | None) -> None:
+        if budget is None:
+            await self.delete_runtime_state("daily_llm_budget_override")
+        else:
+            await self.set_runtime_state("daily_llm_budget_override", str(budget))
+
+    async def get_timed_state(self, key: str, now_ts: float) -> dict[str, Any] | None:
+        raw = await self.get_runtime_state(key)
+        if not raw:
+            return None
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            await self.delete_runtime_state(key)
+            return None
+        if not isinstance(data, dict):
+            await self.delete_runtime_state(key)
+            return None
+        until = float(data.get("until", 0) or 0)
+        if until <= now_ts:
+            await self.delete_runtime_state(key)
+            return None
+        data["remaining_seconds"] = max(0.0, until - now_ts)
+        return data
+
+    async def set_timed_state(self, key: str, payload: dict[str, Any] | None) -> None:
+        if payload is None:
+            await self.delete_runtime_state(key)
+        else:
+            await self.set_runtime_state(key, json.dumps(payload, ensure_ascii=False))
 
     async def get_run_mode(self, fallback: RunMode) -> RunMode:
         raw = await self.get_runtime_state("run_mode")
