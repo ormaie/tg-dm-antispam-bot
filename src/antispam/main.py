@@ -72,6 +72,7 @@ async def _run_service(config_path: Path | None) -> None:
         bot_me = await notifier.start()
         userbot.set_helper_bot_id(bot_me.id)
         user_me = await userbot.start()
+        pipeline.start_background_tasks()
 
         current_mode = await pipeline.get_run_mode()
         user_label = f"{user_me.first_name or ''} {user_me.last_name or ''}".strip() or str(user_me.id)

@@ -283,6 +283,45 @@ class Database:
             await self.conn.commit()
             return deleted
 
+    async def delete_user_messages(self, user_id: int) -> int:
+        async with self._lock:
+            async with self.conn.execute(
+                "DELETE FROM messages WHERE user_id = ?", (user_id,)
+            ) as cur:
+                count = cur.rowcount or 0
+            await self.conn.commit()
+            return count
+
+    async def list_stale_probing_users(self, cutoff_iso: str, limit: int = 100) -> list[StoredUser]:
+        async with self._lock, self.conn.execute(
+            "SELECT * FROM users WHERE status = ? AND updated_at <= ? ORDER BY updated_at ASC LIMIT ?",
+            (UserStatus.PROBING.value, cutoff_iso, limit),
+        ) as cur:
+            rows = await cur.fetchall()
+            return [self._row_to_user(row) for row in rows]
+
+    async def cleanup_expired_records(
+        self,
+        *,
+        message_cutoff_iso: str | None = None,
+        audit_cutoff_iso: str | None = None,
+    ) -> dict[str, int]:
+        messages_deleted = 0
+        audits_deleted = 0
+        async with self._lock:
+            if message_cutoff_iso is not None:
+                async with self.conn.execute(
+                    "DELETE FROM messages WHERE created_at <= ?", (message_cutoff_iso,)
+                ) as cur:
+                    messages_deleted = cur.rowcount or 0
+            if audit_cutoff_iso is not None:
+                async with self.conn.execute(
+                    "DELETE FROM audit_logs WHERE created_at <= ?", (audit_cutoff_iso,)
+                ) as cur:
+                    audits_deleted = cur.rowcount or 0
+            await self.conn.commit()
+        return {"messages_deleted": messages_deleted, "audits_deleted": audits_deleted}
+
     # ---------- Messages ----------
 
     async def add_message(

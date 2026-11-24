@@ -22,6 +22,7 @@ class ScreeningConfig(BaseModel):
     history_check_limit: int = Field(default=10, ge=1, le=50)
     profile_cache_ttl_seconds: int = Field(default=1800, ge=60)
     edit_probation_minutes: int = Field(default=30, ge=0, le=1440)
+    probe_timeout_hours: float = Field(default=24.0, ge=0.0, le=720.0)
     whitelist_user_ids: list[int] = Field(default_factory=list)
     whitelist_usernames: list[str] = Field(default_factory=list)
 
@@ -110,6 +111,13 @@ class LLMConfig(BaseModel):
     )
 
 
+class PrivacyConfig(BaseModel):
+    purge_messages_on_whitelist: bool = True
+    message_retention_days: int = Field(default=7, ge=0, le=365)
+    audit_log_retention_days: int = Field(default=30, ge=0, le=3650)
+    maintenance_interval_minutes: int = Field(default=30, ge=1, le=1440)
+
+
 class DefaultRuleConfig(BaseModel):
     rule_type: Literal["keyword", "regex"] = "keyword"
     pattern: str
@@ -124,6 +132,7 @@ class AppConfig(BaseModel):
     actions: ActionConfig = Field(default_factory=ActionConfig)
     rate_limit: RateLimitConfig = Field(default_factory=RateLimitConfig)
     media: MediaConfig = Field(default_factory=MediaConfig)
+    privacy: PrivacyConfig = Field(default_factory=PrivacyConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
     default_rules: list[DefaultRuleConfig] = Field(default_factory=list)
 

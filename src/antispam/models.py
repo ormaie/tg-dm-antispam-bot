@@ -17,6 +17,7 @@ class UserStatus(str, Enum):
     WHITELISTED = "WHITELISTED"
     PENDING_REVIEW = "PENDING_REVIEW"
     BLOCKED = "BLOCKED"
+    EXPIRED = "EXPIRED"
 
 
 class DecisionType(str, Enum):

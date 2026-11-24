@@ -26,6 +26,8 @@ screening:
   profile_cache_ttl_seconds: 1800
   # AI 自动放行后的消息编辑观察期（分钟）：期间若对方编辑消息将重新复审，防先打招呼后改成广告（0 表示关闭）
   edit_probation_minutes: 30
+  # 追问后对方超过多少小时未回复自动收尾标记为 EXPIRED 并保持静音归档（0 表示关闭）
+  probe_timeout_hours: 24
   # 永久白名单（用户 ID 或不带 @ 的用户名）
   whitelist_user_ids: []
   whitelist_usernames: []
@@ -85,6 +87,16 @@ media:
     - ".lnk"
     - ".dmg"
     - ".iso"
+
+privacy:
+  # 用户确认放行加白后，立刻删除其在数据库中的审核期临时消息（隐私最小化）
+  purge_messages_on_whitelist: true
+  # 审核期临时消息最长保留天数（0 表示不自动清理）
+  message_retention_days: 7
+  # 审核日志（audit_logs）最长保留天数（0 表示不自动清理）
+  audit_log_retention_days: 30
+  # 后台定期清理与超时巡检间隔（分钟）
+  maintenance_interval_minutes: 30
 
 llm:
   timeout_seconds: 30

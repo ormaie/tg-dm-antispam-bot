@@ -674,7 +674,16 @@ async def test_owner_outgoing_never_persists_friends_or_plaintext_messages(tmp_p
 
     user = await db.get_user(14)
     assert user is not None and user.status == UserStatus.WHITELISTED
-    stored_msgs = await db.get_recent_messages(14)
+    # Default purge_messages_on_whitelist=True wipes temporary screening messages too
+    assert await db.get_recent_messages(14) == []
+
+    # Even with purge disabled, owner outgoing plaintext is never stored
+    pipeline.cfg.privacy.purge_messages_on_whitelist = False
+    await pipeline.handle_incoming_message(
+        IncomingMessage(user_id=15, tg_msg_id=2, text="我是另一个同事", display_name="Colleague2")
+    )
+    await pipeline.handle_owner_outgoing(15, "绝不落盘的私密回复")
+    stored_msgs = await db.get_recent_messages(15)
     assert len(stored_msgs) == 1
     assert stored_msgs[0].direction == "in"
     assert all(m.direction != "out_owner" for m in stored_msgs)
@@ -978,6 +987,94 @@ async def test_lockdown_relax_budget_override_and_reset_user(tmp_path: Path) -> 
     assert await pipeline.reset_user(9801) is True
     assert await db.get_user(9801) is None
     assert await db.get_recent_messages(9801) == []
+
+    await pipeline.shutdown()
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_privacy_purge_retention_cleanup_and_probe_timeout(tmp_path: Path) -> None:
+    db = Database(tmp_path / "maintenance.db")
+    await db.connect()
+    tg = FakeTelegramActions()
+    notifier = FakeNotifier()
+    llm = FakeLLM(
+        [
+            LLMVerdict(
+                decision=DecisionType.PASS,
+                confidence=0.95,
+                category="normal",
+                reason="开源项目用户咨询",
+            ),
+            LLMVerdict(
+                decision=DecisionType.ASK,
+                confidence=0.6,
+                category="unknown_intent",
+                reason="只打招呼",
+                reply_to_user="请说明来意",
+            ),
+            LLMVerdict(
+                decision=DecisionType.PASS,
+                confidence=0.92,
+                category="normal",
+                reason="几天后回来清晰说明了来意",
+            ),
+        ]
+    )
+    pipeline = ModerationPipeline(
+        cfg=_fast_cfg(RunMode.AUTO), db=db, tg=tg, notifier=notifier, llm=llm  # type: ignore[arg-type]
+    )
+
+    # 1. Auto-pass purges temporary screening messages automatically
+    await pipeline.handle_incoming_message(
+        IncomingMessage(user_id=9901, tg_msg_id=1, text="你好咨询部署问题", display_name="User1")
+    )
+    await asyncio.sleep(0.12)
+    assert await db.get_recent_messages(9901) == []
+
+    # 2. Stale probing user gets swept to EXPIRED after timeout, and can still resume later
+    await pipeline.handle_incoming_message(
+        IncomingMessage(user_id=9902, tg_msg_id=2, text="你好", display_name="Ghost")
+    )
+    await asyncio.sleep(0.12)
+    u_probing = await db.get_user(9902)
+    assert u_probing is not None and u_probing.status == UserStatus.PROBING
+
+    # Backdate user updated_at + old message + old audit log to 40 days ago
+    old_ts = "2020-01-01T00:00:00+00:00"
+    async with db._lock:
+        await db.conn.execute(
+            "UPDATE users SET updated_at = ? WHERE user_id = ?", (old_ts, 9902)
+        )
+        await db.conn.execute(
+            "INSERT INTO messages (user_id, tg_msg_id, direction, text, created_at) VALUES (?, ?, 'in', 'old', ?)",
+            (9999, 99, old_ts),
+        )
+        await db.conn.execute(
+            """
+            INSERT INTO audit_logs (user_id, decision, confidence, category, reason, action_taken, created_at)
+            VALUES (?, 'review', 0.5, 'unknown_intent', 'old', 'review', ?)
+            """,
+            (9999, old_ts),
+        )
+        await db.conn.commit()
+
+    summary = await pipeline.run_maintenance_once()
+    assert summary["expired_probes"] == 1
+    assert summary["messages_deleted"] >= 1
+    assert summary["audits_deleted"] >= 1
+
+    u_expired = await db.get_user(9902)
+    assert u_expired is not None and u_expired.status == UserStatus.EXPIRED
+    assert await db.get_recent_messages(9999) == []
+
+    # Returning EXPIRED user sends real explanation -> resumes screening & passes
+    await pipeline.handle_incoming_message(
+        IncomingMessage(user_id=9902, tg_msg_id=3, text="不好意思前几天忙，我在开源群看到你", display_name="Ghost")
+    )
+    await asyncio.sleep(0.12)
+    u_returned = await db.get_user(9902)
+    assert u_returned is not None and u_returned.status == UserStatus.WHITELISTED
 
     await pipeline.shutdown()
     await db.close()

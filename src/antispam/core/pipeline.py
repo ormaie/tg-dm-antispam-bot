@@ -5,7 +5,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from antispam.config import AppConfig
@@ -103,6 +103,7 @@ class ModerationPipeline:
 
         self._pending: dict[int, _PendingBatch] = {}
         self._user_locks: dict[int, asyncio.Lock] = {}
+        self._maintenance_task: asyncio.Task[None] | None = None
 
     def _lock_for(self, user_id: int) -> asyncio.Lock:
         lock = self._user_locks.get(user_id)
@@ -190,7 +191,115 @@ class ModerationPipeline:
         if batch and batch.timer_task and not batch.timer_task.done():
             batch.timer_task.cancel()
 
+    def start_background_tasks(self) -> None:
+        if self._maintenance_task is None or self._maintenance_task.done():
+            self._maintenance_task = asyncio.create_task(self._maintenance_loop())
+
+    async def _maintenance_loop(self) -> None:
+        interval = max(60.0, self.cfg.privacy.maintenance_interval_minutes * 60.0)
+        try:
+            await asyncio.sleep(10.0)
+            while True:
+                try:
+                    summary = await self.run_maintenance_once()
+                    if any(summary.values()):
+                        logger.info("Periodic maintenance finished: %s", summary)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("Error during periodic maintenance sweep")
+                await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            return
+
+    async def run_maintenance_once(
+        self,
+        *,
+        message_days: int | None = None,
+        audit_days: int | None = None,
+        probe_timeout_hours: float | None = None,
+    ) -> dict[str, int]:
+        now = datetime.now(UTC)
+        expired_count = 0
+
+        timeout_h = (
+            self.cfg.screening.probe_timeout_hours
+            if probe_timeout_hours is None
+            else probe_timeout_hours
+        )
+        if timeout_h > 0:
+            cutoff_iso = (now - timedelta(hours=timeout_h)).isoformat(timespec="seconds")
+            stale_users = await self.db.list_stale_probing_users(cutoff_iso)
+            run_mode = await self.get_run_mode()
+            for stale in stale_users:
+                if stale.user_id in self._pending:
+                    continue
+                async with self._lock_for(stale.user_id):
+                    current = await self.db.get_user(stale.user_id)
+                    if (
+                        current is None
+                        or current.status != UserStatus.PROBING
+                        or current.updated_at > cutoff_iso
+                    ):
+                        continue
+                    if run_mode != RunMode.DRYRUN:
+                        if (
+                            self.cfg.screening.auto_archive
+                            and not current.archived
+                            and await self.tg.archive_chat(stale.user_id, True)
+                        ):
+                            await self.db.set_user_flags(stale.user_id, archived=True)
+                        if (
+                            self.cfg.screening.auto_mute
+                            and not current.muted
+                            and await self.tg.mute_chat(stale.user_id, True)
+                        ):
+                            await self.db.set_user_flags(stale.user_id, muted=True)
+                    await self.db.update_user_status(
+                        stale.user_id,
+                        UserStatus.EXPIRED,
+                        reason=f"追问超过 {timeout_h:g} 小时未回复，已自动静默归档",
+                    )
+                    await self.db.add_audit_log(
+                        user_id=stale.user_id,
+                        decision="review",
+                        confidence=0.5,
+                        category="unknown_intent",
+                        reason=f"追问超时（>{timeout_h:g}h）自动归档收尾",
+                        action_taken="probe_expired",
+                        model_used="maintenance",
+                    )
+                    expired_count += 1
+
+        eff_msg_days = (
+            self.cfg.privacy.message_retention_days if message_days is None else message_days
+        )
+        eff_audit_days = (
+            self.cfg.privacy.audit_log_retention_days if audit_days is None else audit_days
+        )
+        msg_cutoff = (
+            (now - timedelta(days=eff_msg_days)).isoformat(timespec="seconds")
+            if eff_msg_days > 0
+            else None
+        )
+        audit_cutoff = (
+            (now - timedelta(days=eff_audit_days)).isoformat(timespec="seconds")
+            if eff_audit_days > 0
+            else None
+        )
+        cleaned = await self.db.cleanup_expired_records(
+            message_cutoff_iso=msg_cutoff,
+            audit_cutoff_iso=audit_cutoff,
+        )
+        return {
+            "expired_probes": expired_count,
+            "messages_deleted": cleaned["messages_deleted"],
+            "audits_deleted": cleaned["audits_deleted"],
+        }
+
     async def shutdown(self) -> None:
+        if self._maintenance_task and not self._maintenance_task.done():
+            self._maintenance_task.cancel()
         for user_id in list(self._pending.keys()):
             self._cancel_pending(user_id)
 
@@ -460,6 +569,8 @@ class ModerationPipeline:
                 reason="机主已手动回复接管对话",
                 clear_auto_passed=True,
             )
+            if self.cfg.privacy.purge_messages_on_whitelist:
+                await self.db.delete_user_messages(user_id)
             logger.info("Human takeover: user %s marked WHITELISTED", user_id)
 
             if user.archived and await self.tg.archive_chat(user_id, False):
@@ -721,6 +832,8 @@ class ModerationPipeline:
                 reason=verdict.reason,
                 auto_passed_at=utc_now_iso(),
             )
+            if self.cfg.privacy.purge_messages_on_whitelist:
+                await self.db.delete_user_messages(user_id)
             await self.db.add_audit_log(
                 user_id=user_id,
                 decision=verdict.decision.value,
@@ -894,6 +1007,8 @@ class ModerationPipeline:
                 reason="机主手动放行/加白",
                 clear_auto_passed=True,
             )
+            if self.cfg.privacy.purge_messages_on_whitelist:
+                await self.db.delete_user_messages(user_id)
             await self.db.add_audit_log(
                 user_id=user_id,
                 decision="pass",

@@ -187,6 +187,8 @@ class HelperBotNotifier:
             await self._cmd_budget(event, args)
         elif cmd == "/reset_user":
             await self._cmd_reset_user(event, args)
+        elif cmd == "/clean":
+            await self._cmd_clean(event, args)
         elif cmd == "/whitelist":
             await self._cmd_whitelist(event, args)
         elif cmd == "/allow":
@@ -214,6 +216,7 @@ class HelperBotNotifier:
             "• /allow <code>&lt;id|@user&gt;</code> / /block <code>&lt;id|@user&gt;</code> — 手动放行或拉黑\n"
             "• /whitelist <code>[list|add|del]</code> — 管理白名单\n"
             "• /reset_user <code>&lt;id|@user&gt;</code> — 清空单人记录方便重测\n"
+            "• /clean <code>[天数]</code> — 立即执行超时追问收尾与过期数据清理\n"
             "• /pending — 列出待人工确认的陌生人\n"
             "• /rules <code>list|add|del</code> — 热管理本地前置拦截规则"
         )
@@ -365,6 +368,27 @@ class HelperBotNotifier:
                 f"ℹ️ 数据库中未找到用户 {_esc(name)} (<code>{uid}</code>) 的记录。",
                 parse_mode="html",
             )
+
+    async def _cmd_clean(self, event: events.NewMessage.Event, args: list[str]) -> None:
+        assert self._pipeline is not None
+        days_override: int | None = None
+        if args:
+            if not args[0].isdigit():
+                await event.reply("用法：/clean 或 /clean <保留天数>（例如 /clean 7）")
+                return
+            days_override = int(args[0])
+        summary = await self._pipeline.run_maintenance_once(
+            message_days=days_override,
+            audit_days=days_override,
+        )
+        scope = f"早于 {days_override} 天的数据" if days_override is not None else "按默认保留策略"
+        await event.reply(
+            f"🧹 <b>维护清理完成</b>（{scope}）\n"
+            f"• 超时未回追问归档：<b>{summary['expired_probes']}</b> 人\n"
+            f"• 清理临时消息：<b>{summary['messages_deleted']}</b> 条\n"
+            f"• 清理历史审计日志：<b>{summary['audits_deleted']}</b> 条",
+            parse_mode="html",
+        )
 
     async def _cmd_whitelist(self, event: events.NewMessage.Event, args: list[str]) -> None:
         assert self._pipeline is not None
