@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import UTC, datetime
 from pathlib import Path
@@ -96,6 +97,7 @@ class Database:
     def __init__(self, path: Path | str) -> None:
         self._path = str(path)
         self._conn: aiosqlite.Connection | None = None
+        self._lock = asyncio.Lock()
 
     @property
     def conn(self) -> aiosqlite.Connection:
@@ -136,18 +138,22 @@ class Database:
             updated_at=row["updated_at"],
         )
 
+    async def _get_user_unlocked(self, user_id: int) -> StoredUser | None:
+        async with self.conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)) as cur:
+            row = await cur.fetchone()
+            return self._row_to_user(row) if row else None
+
     async def get_user(self, user_id: int) -> StoredUser | None:
-        cur = await self.conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
-        row = await cur.fetchone()
-        return self._row_to_user(row) if row else None
+        async with self._lock:
+            return await self._get_user_unlocked(user_id)
 
     async def find_user_by_username(self, username: str) -> StoredUser | None:
         clean = username.lstrip("@").strip().lower()
-        cur = await self.conn.execute(
+        async with self._lock, self.conn.execute(
             "SELECT * FROM users WHERE LOWER(username) = ? LIMIT 1", (clean,)
-        )
-        row = await cur.fetchone()
-        return self._row_to_user(row) if row else None
+        ) as cur:
+            row = await cur.fetchone()
+            return self._row_to_user(row) if row else None
 
     async def get_or_create_user(
         self,
@@ -156,31 +162,26 @@ class Database:
         username: str | None = None,
         default_status: UserStatus = UserStatus.NEW,
     ) -> StoredUser:
-        existing = await self.get_user(user_id)
         now = utc_now_iso()
         clean_username = username.lstrip("@") if username else None
-        if existing is not None:
-            if existing.display_name != display_name or existing.username != clean_username:
-                await self.conn.execute(
-                    "UPDATE users SET display_name = ?, username = ?, updated_at = ? WHERE user_id = ?",
-                    (display_name, clean_username, now, user_id),
-                )
-                await self.conn.commit()
-                existing = await self.get_user(user_id)
-                assert existing is not None
-            return existing
-
-        await self.conn.execute(
-            """
-            INSERT INTO users (user_id, username, display_name, status, first_seen_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (user_id, clean_username, display_name, default_status.value, now, now),
-        )
-        await self.conn.commit()
-        created = await self.get_user(user_id)
-        assert created is not None
-        return created
+        async with self._lock:
+            await self.conn.execute(
+                """
+                INSERT INTO users (user_id, username, display_name, status, first_seen_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    username = excluded.username,
+                    display_name = excluded.display_name,
+                    updated_at = excluded.updated_at
+                WHERE users.username IS NOT excluded.username
+                   OR users.display_name IS NOT excluded.display_name
+                """,
+                (user_id, clean_username, display_name, default_status.value, now, now),
+            )
+            await self.conn.commit()
+            user = await self._get_user_unlocked(user_id)
+            assert user is not None
+            return user
 
     async def update_user_status(
         self,
@@ -207,18 +208,22 @@ class Database:
         if reset_probes:
             fields.append("probe_count = 0")
         params.append(user_id)
-        await self.conn.execute(f"UPDATE users SET {', '.join(fields)} WHERE user_id = ?", params)
-        await self.conn.commit()
+        async with self._lock:
+            await self.conn.execute(
+                f"UPDATE users SET {', '.join(fields)} WHERE user_id = ?", params
+            )
+            await self.conn.commit()
 
     async def increment_probe_count(self, user_id: int) -> int:
         now = utc_now_iso()
-        await self.conn.execute(
-            "UPDATE users SET probe_count = probe_count + 1, updated_at = ? WHERE user_id = ?",
-            (now, user_id),
-        )
-        await self.conn.commit()
-        user = await self.get_user(user_id)
-        return user.probe_count if user else 0
+        async with self._lock:
+            await self.conn.execute(
+                "UPDATE users SET probe_count = probe_count + 1, updated_at = ? WHERE user_id = ?",
+                (now, user_id),
+            )
+            await self.conn.commit()
+            user = await self._get_user_unlocked(user_id)
+            return user.probe_count if user else 0
 
     async def set_user_flags(
         self,
@@ -240,16 +245,19 @@ class Database:
         fields.append("updated_at = ?")
         params.append(utc_now_iso())
         params.append(user_id)
-        await self.conn.execute(f"UPDATE users SET {', '.join(fields)} WHERE user_id = ?", params)
-        await self.conn.commit()
+        async with self._lock:
+            await self.conn.execute(
+                f"UPDATE users SET {', '.join(fields)} WHERE user_id = ?", params
+            )
+            await self.conn.commit()
 
     async def list_users_by_status(self, status: UserStatus, limit: int = 20) -> list[StoredUser]:
-        cur = await self.conn.execute(
+        async with self._lock, self.conn.execute(
             "SELECT * FROM users WHERE status = ? ORDER BY updated_at DESC LIMIT ?",
             (status.value, limit),
-        )
-        rows = await cur.fetchall()
-        return [self._row_to_user(row) for row in rows]
+        ) as cur:
+            rows = await cur.fetchall()
+            return [self._row_to_user(row) for row in rows]
 
     # ---------- Messages ----------
 
@@ -265,22 +273,24 @@ class Database:
     ) -> int:
         now = utc_now_iso()
         meta_str = json.dumps(media_meta or {}, ensure_ascii=False)
-        cur = await self.conn.execute(
-            """
-            INSERT INTO messages (user_id, tg_msg_id, direction, text, media_type, media_meta_json, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (user_id, tg_msg_id, direction, text, media_type, meta_str, now),
-        )
-        await self.conn.commit()
-        return cur.lastrowid or 0
+        async with self._lock:
+            async with self.conn.execute(
+                """
+                INSERT INTO messages (user_id, tg_msg_id, direction, text, media_type, media_meta_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (user_id, tg_msg_id, direction, text, media_type, meta_str, now),
+            ) as cur:
+                lastrowid = cur.lastrowid or 0
+            await self.conn.commit()
+            return lastrowid
 
     async def get_recent_messages(self, user_id: int, limit: int = 20) -> list[StoredMessage]:
-        cur = await self.conn.execute(
+        async with self._lock, self.conn.execute(
             "SELECT * FROM messages WHERE user_id = ? ORDER BY id DESC LIMIT ?",
             (user_id, limit),
-        )
-        rows = await cur.fetchall()
+        ) as cur:
+            rows = await cur.fetchall()
         result: list[StoredMessage] = []
         for row in reversed(rows):
             try:
@@ -318,30 +328,31 @@ class Database:
         completion_tokens: int = 0,
         dry_run: bool = False,
     ) -> None:
-        await self.conn.execute(
-            """
-            INSERT INTO audit_logs (
-                user_id, decision, confidence, category, reason, reply_text,
-                action_taken, model_used, prompt_tokens, completion_tokens, dry_run, created_at
+        async with self._lock:
+            await self.conn.execute(
+                """
+                INSERT INTO audit_logs (
+                    user_id, decision, confidence, category, reason, reply_text,
+                    action_taken, model_used, prompt_tokens, completion_tokens, dry_run, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    user_id,
+                    decision,
+                    confidence,
+                    category,
+                    reason,
+                    reply_text,
+                    action_taken,
+                    model_used,
+                    prompt_tokens,
+                    completion_tokens,
+                    int(dry_run),
+                    utc_now_iso(),
+                ),
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                user_id,
-                decision,
-                confidence,
-                category,
-                reason,
-                reply_text,
-                action_taken,
-                model_used,
-                prompt_tokens,
-                completion_tokens,
-                int(dry_run),
-                utc_now_iso(),
-            ),
-        )
-        await self.conn.commit()
+            await self.conn.commit()
 
     # ---------- Rules ----------
 
@@ -360,32 +371,38 @@ class Database:
     async def seed_default_rules_if_empty(self, default_rules: list[DefaultRuleConfig]) -> None:
         if not default_rules:
             return
-        seeded = await self.get_runtime_state("rules_seeded")
-        if seeded == "1":
-            return
-        cur = await self.conn.execute("SELECT COUNT(*) AS cnt FROM rules")
-        row = await cur.fetchone()
-        if row and row["cnt"] == 0:
-            now = utc_now_iso()
-            for rule in default_rules:
-                await self.conn.execute(
-                    """
-                    INSERT INTO rules (rule_type, pattern, action, note, enabled, created_at)
-                    VALUES (?, ?, ?, ?, 1, ?)
-                    """,
-                    (rule.rule_type, rule.pattern, rule.action, rule.note, now),
-                )
-        await self.set_runtime_state("rules_seeded", "1")
-        await self.conn.commit()
+        async with self._lock:
+            seeded = await self._get_runtime_state_unlocked("rules_seeded")
+            if seeded == "1":
+                return
+            async with self.conn.execute("SELECT COUNT(*) AS cnt FROM rules") as cur:
+                row = await cur.fetchone()
+            if row and row["cnt"] == 0:
+                now = utc_now_iso()
+                for rule in default_rules:
+                    await self.conn.execute(
+                        """
+                        INSERT INTO rules (rule_type, pattern, action, note, enabled, created_at)
+                        VALUES (?, ?, ?, ?, 1, ?)
+                        """,
+                        (rule.rule_type, rule.pattern, rule.action, rule.note, now),
+                    )
+            await self.conn.execute(
+                """
+                INSERT INTO runtime_state (key, value) VALUES ('rules_seeded', '1')
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """
+            )
+            await self.conn.commit()
 
     async def list_rules(self, enabled_only: bool = True) -> list[LocalRule]:
         query = "SELECT * FROM rules"
         if enabled_only:
             query += " WHERE enabled = 1"
         query += " ORDER BY id ASC"
-        cur = await self.conn.execute(query)
-        rows = await cur.fetchall()
-        return [self._row_to_rule(row) for row in rows]
+        async with self._lock, self.conn.execute(query) as cur:
+            rows = await cur.fetchall()
+            return [self._row_to_rule(row) for row in rows]
 
     async def add_rule(
         self,
@@ -395,42 +412,62 @@ class Database:
         note: str = "",
     ) -> LocalRule:
         now = utc_now_iso()
-        cur = await self.conn.execute(
-            """
-            INSERT INTO rules (rule_type, pattern, action, note, enabled, created_at)
-            VALUES (?, ?, ?, ?, 1, ?)
-            """,
-            (rule_type, pattern, action, note, now),
-        )
-        await self.conn.commit()
-        rule_id = cur.lastrowid
-        assert rule_id is not None
-        row_cur = await self.conn.execute("SELECT * FROM rules WHERE id = ?", (rule_id,))
-        row = await row_cur.fetchone()
-        assert row is not None
-        return self._row_to_rule(row)
+        async with self._lock:
+            async with self.conn.execute(
+                """
+                INSERT INTO rules (rule_type, pattern, action, note, enabled, created_at)
+                VALUES (?, ?, ?, ?, 1, ?)
+                """,
+                (rule_type, pattern, action, note, now),
+            ) as cur:
+                rule_id = cur.lastrowid
+            await self.conn.commit()
+            assert rule_id is not None
+            async with self.conn.execute("SELECT * FROM rules WHERE id = ?", (rule_id,)) as row_cur:
+                row = await row_cur.fetchone()
+            assert row is not None
+            return self._row_to_rule(row)
 
     async def delete_rule(self, rule_id: int) -> bool:
-        cur = await self.conn.execute("DELETE FROM rules WHERE id = ?", (rule_id,))
-        await self.conn.commit()
-        return cur.rowcount > 0
+        async with self._lock:
+            async with self.conn.execute("DELETE FROM rules WHERE id = ?", (rule_id,)) as cur:
+                deleted = cur.rowcount > 0
+            await self.conn.commit()
+            return deleted
 
     # ---------- Runtime State & Stats ----------
 
+    async def _get_runtime_state_unlocked(
+        self, key: str, default: str | None = None
+    ) -> str | None:
+        async with self.conn.execute(
+            "SELECT value FROM runtime_state WHERE key = ?", (key,)
+        ) as cur:
+            row = await cur.fetchone()
+            return row["value"] if row else default
+
+    async def _get_daily_llm_calls_unlocked(self, date_str: str | None = None) -> int:
+        day = date_str or utc_today_str()
+        raw = await self._get_runtime_state_unlocked(f"llm_calls:{day}", "0")
+        try:
+            return int(raw or "0")
+        except ValueError:
+            return 0
+
     async def get_runtime_state(self, key: str, default: str | None = None) -> str | None:
-        cur = await self.conn.execute("SELECT value FROM runtime_state WHERE key = ?", (key,))
-        row = await cur.fetchone()
-        return row["value"] if row else default
+        async with self._lock:
+            return await self._get_runtime_state_unlocked(key, default)
 
     async def set_runtime_state(self, key: str, value: str) -> None:
-        await self.conn.execute(
-            """
-            INSERT INTO runtime_state (key, value) VALUES (?, ?)
-            ON CONFLICT(key) DO UPDATE SET value = excluded.value
-            """,
-            (key, value),
-        )
-        await self.conn.commit()
+        async with self._lock:
+            await self.conn.execute(
+                """
+                INSERT INTO runtime_state (key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (key, value),
+            )
+            await self.conn.commit()
 
     async def get_run_mode(self, fallback: RunMode) -> RunMode:
         raw = await self.get_runtime_state("run_mode")
@@ -445,46 +482,79 @@ class Database:
         await self.set_runtime_state("run_mode", mode.value)
 
     async def get_daily_llm_calls(self, date_str: str | None = None) -> int:
-        day = date_str or utc_today_str()
-        raw = await self.get_runtime_state(f"llm_calls:{day}", "0")
-        try:
-            return int(raw or "0")
-        except ValueError:
-            return 0
+        async with self._lock:
+            return await self._get_daily_llm_calls_unlocked(date_str)
 
     async def increment_daily_llm_calls(self, date_str: str | None = None) -> int:
         day = date_str or utc_today_str()
         key = f"llm_calls:{day}"
-        current = await self.get_daily_llm_calls(day)
-        new_val = current + 1
-        await self.set_runtime_state(key, str(new_val))
-        return new_val
+        async with self._lock:
+            async with self.conn.execute(
+                """
+                INSERT INTO runtime_state (key, value) VALUES (?, '1')
+                ON CONFLICT(key) DO UPDATE
+                    SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)
+                RETURNING CAST(value AS INTEGER) AS new_val
+                """,
+                (key,),
+            ) as cur:
+                row = await cur.fetchone()
+            await self.conn.commit()
+            return int(row["new_val"]) if row else 1
+
+    async def try_reserve_daily_llm_call(
+        self, budget: int, date_str: str | None = None
+    ) -> tuple[bool, int]:
+        """Atomically check daily budget and reserve one LLM call slot."""
+        day = date_str or utc_today_str()
+        key = f"llm_calls:{day}"
+        async with self._lock:
+            if budget <= 0:
+                current = await self._get_daily_llm_calls_unlocked(day)
+                return False, current
+            async with self.conn.execute(
+                """
+                INSERT INTO runtime_state (key, value) VALUES (?, '1')
+                ON CONFLICT(key) DO UPDATE
+                    SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)
+                    WHERE CAST(value AS INTEGER) < ?
+                RETURNING CAST(value AS INTEGER) AS new_val
+                """,
+                (key, budget),
+            ) as cur:
+                row = await cur.fetchone()
+            await self.conn.commit()
+            if row is not None:
+                return True, int(row["new_val"])
+            current = await self._get_daily_llm_calls_unlocked(day)
+            return False, current
 
     async def get_today_stats(self, date_str: str | None = None) -> dict[str, int]:
         day = date_str or utc_today_str()
         prefix = f"{day}%"
-        cur = await self.conn.execute(
-            """
-            SELECT
-                COUNT(*) AS total_audits,
-                SUM(CASE WHEN action_taken IN ('auto_block', 'manual_block', 'manual_report') THEN 1 ELSE 0 END) AS blocked,
-                SUM(CASE WHEN action_taken IN ('auto_pass', 'manual_allow') THEN 1 ELSE 0 END) AS passed,
-                SUM(CASE WHEN action_taken = 'probe' THEN 1 ELSE 0 END) AS probed,
-                SUM(CASE WHEN action_taken = 'review' THEN 1 ELSE 0 END) AS sent_to_review,
-                COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
-                COALESCE(SUM(completion_tokens), 0) AS completion_tokens
-            FROM audit_logs
-            WHERE created_at LIKE ?
-            """,
-            (prefix,),
-        )
-        row = await cur.fetchone()
-        pending_cur = await self.conn.execute(
-            "SELECT COUNT(*) AS cnt FROM users WHERE status = ?",
-            (UserStatus.PENDING_REVIEW.value,),
-        )
-        pending_row = await pending_cur.fetchone()
-        llm_calls = await self.get_daily_llm_calls(day)
+        async with self._lock:
+            async with self.conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS total_audits,
+                    SUM(CASE WHEN action_taken IN ('auto_block', 'manual_block', 'manual_report') THEN 1 ELSE 0 END) AS blocked,
+                    SUM(CASE WHEN action_taken IN ('auto_pass', 'manual_allow') THEN 1 ELSE 0 END) AS passed,
+                    SUM(CASE WHEN action_taken = 'probe' THEN 1 ELSE 0 END) AS probed,
+                    SUM(CASE WHEN action_taken = 'review' THEN 1 ELSE 0 END) AS sent_to_review,
+                    COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+                    COALESCE(SUM(completion_tokens), 0) AS completion_tokens
+                FROM audit_logs
+                WHERE created_at LIKE ?
+                """,
+                (prefix,),
+            ) as cur:
+                row = await cur.fetchone()
+            async with self.conn.execute(
+                "SELECT COUNT(*) AS cnt FROM users WHERE status = ?",
+                (UserStatus.PENDING_REVIEW.value,),
+            ) as pending_cur:
+                pending_row = await pending_cur.fetchone()
+            llm_calls = await self._get_daily_llm_calls_unlocked(day)
         return {
             "total_audits": int(row["total_audits"] or 0) if row else 0,
             "blocked": int(row["blocked"] or 0) if row else 0,

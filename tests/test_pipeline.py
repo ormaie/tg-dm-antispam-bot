@@ -578,3 +578,52 @@ async def test_userbot_send_probe_reply_disables_parse_mode_and_preview(tmp_path
         link_preview=False,
     )
     userbot.client.session.close()
+
+
+@pytest.mark.asyncio
+async def test_daily_llm_budget_atomic_under_50_concurrent_calls(tmp_path: Path) -> None:
+    db = Database(tmp_path / "race.db")
+    await db.connect()
+
+    # 1. 50 concurrent increments must equal exactly 50 (no lost updates)
+    results = await asyncio.gather(
+        *[db.increment_daily_llm_calls(date_str="2026-01-01") for _ in range(50)]
+    )
+    assert len(results) == 50
+    assert await db.get_daily_llm_calls(date_str="2026-01-01") == 50
+
+    # 2. 50 concurrent spammer flushes against budget=10 must invoke LLM exactly 10 times
+    tg = FakeTelegramActions()
+    notifier = FakeNotifier()
+    llm = FakeLLM()
+    cfg = _fast_cfg(RunMode.AUTO)
+    cfg.screening.debounce_seconds = 0.02
+    cfg.rate_limit.daily_llm_budget_calls = 10
+
+    pipeline = ModerationPipeline(
+        cfg=cfg, db=db, tg=tg, notifier=notifier, llm=llm  # type: ignore[arg-type]
+    )
+    await asyncio.gather(
+        *[
+            pipeline.handle_incoming_message(
+                IncomingMessage(
+                    user_id=9000 + i,
+                    tg_msg_id=i + 1,
+                    text=f"广告消息 {i}",
+                    display_name=f"Spammer{i}",
+                )
+            )
+            for i in range(50)
+        ]
+    )
+    await asyncio.sleep(0.25)
+
+    assert len(llm.calls) == 10
+    assert await db.get_daily_llm_calls() == 10
+    budget_tripped = [
+        c for c in notifier.review_cards if c["verdict"].model_used == "budget_guard"
+    ]
+    assert len(budget_tripped) == 40
+
+    await pipeline.shutdown()
+    await db.close()

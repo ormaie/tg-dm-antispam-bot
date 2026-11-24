@@ -357,10 +357,10 @@ class ModerationPipeline:
                 model_used="local_rule",
             )
 
-        # Stage 2: Daily LLM budget circuit breaker
+        # Stage 2: Daily LLM budget circuit breaker (atomic check + reserve)
         budget = self.cfg.rate_limit.daily_llm_budget_calls
-        used_today = await self.db.get_daily_llm_calls()
-        if used_today >= budget:
+        reserved, used_today = await self.db.try_reserve_daily_llm_call(budget)
+        if not reserved:
             return LLMVerdict(
                 decision=DecisionType.REVIEW,
                 confidence=0.5,
@@ -369,7 +369,6 @@ class ModerationPipeline:
                 model_used="budget_guard",
             )
 
-        await self.db.increment_daily_llm_calls()
         return await self.llm.evaluate(
             profile=profile,
             history=prior_history,
