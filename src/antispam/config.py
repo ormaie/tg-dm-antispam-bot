@@ -40,6 +40,8 @@ class ActionConfig(BaseModel):
     auto_block_delete_history: bool = True
     auto_block_revoke_both: bool = True
     auto_block_report_spam: bool = False
+    use_fixed_probe_message: bool = False
+    max_probe_reply_chars: int = Field(default=200, ge=40, le=500)
     reply_delay_min_seconds: float = Field(default=2.0, ge=0.0, le=30.0)
     reply_delay_max_seconds: float = Field(default=5.0, ge=0.0, le=60.0)
     simulate_typing: bool = True

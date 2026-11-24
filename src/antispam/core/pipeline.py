@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from antispam.config import AppConfig
 from antispam.core.enricher import ProfileEnricher
 from antispam.core.interfaces import NotifierProtocol, TelegramActionsProtocol
-from antispam.core.llm import LLMModerator
+from antispam.core.llm import LLMModerator, sanitize_probe_reply
 from antispam.core.ratelimit import SlidingWindowRateLimiter
 from antispam.core.rules import RuleEngine
 from antispam.models import (
@@ -511,7 +511,14 @@ class ModerationPipeline:
                 )
                 return
 
-            reply_text = verdict.reply_to_user or self.cfg.llm.fallback_probe_message
+            if self.cfg.actions.use_fixed_probe_message:
+                reply_text = self.cfg.llm.fallback_probe_message
+            else:
+                reply_text = sanitize_probe_reply(
+                    verdict.reply_to_user,
+                    fallback=self.cfg.llm.fallback_probe_message,
+                    max_length=self.cfg.actions.max_probe_reply_chars,
+                )
             sent_msg_id = await self.tg.send_probe_reply(user_id, reply_text)
             await self.db.add_message(
                 user_id=user_id,

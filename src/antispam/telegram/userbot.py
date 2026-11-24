@@ -543,7 +543,12 @@ class UserbotClient:
                 await asyncio.sleep(delay)
 
             self._register_in_flight_reply(user_id, text)
-            msg = await self.client.send_message(peer, text)
+            msg = await self.client.send_message(
+                peer,
+                text,
+                parse_mode=None,
+                link_preview=False,
+            )
             if len(self._bot_sent_msg_ids) > 1000:
                 self._bot_sent_msg_ids.clear()
             self._bot_sent_msg_ids.add(msg.id)

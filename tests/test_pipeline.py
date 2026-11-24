@@ -492,3 +492,89 @@ async def test_auto_pass_releases_chat_and_marks_unread(tmp_path: Path) -> None:
 
     await pipeline.shutdown()
     await db.close()
+
+
+@pytest.mark.asyncio
+async def test_probe_reply_sanitized_and_fixed_mode_enforced(tmp_path: Path) -> None:
+    db = Database(tmp_path / "test.db")
+    await db.connect()
+    tg = FakeTelegramActions()
+    notifier = FakeNotifier()
+    llm = FakeLLM(
+        [
+            LLMVerdict(
+                decision=DecisionType.ASK,
+                confidence=0.6,
+                category="unknown_intent",
+                reason="问来意",
+                reply_to_user="请点击 https://evil.com 或联系 @scam 核实",
+            ),
+            LLMVerdict(
+                decision=DecisionType.ASK,
+                confidence=0.6,
+                category="unknown_intent",
+                reason="问来意",
+                reply_to_user="这是一条正常的定制追问",
+            ),
+        ]
+    )
+
+    cfg = _fast_cfg(RunMode.AUTO)
+    pipeline = ModerationPipeline(
+        cfg=cfg, db=db, tg=tg, notifier=notifier, llm=llm  # type: ignore[arg-type]
+    )
+
+    # Unsafe LLM reply containing URL & @ must fall back to static probe message
+    await pipeline.handle_incoming_message(
+        IncomingMessage(user_id=8001, tg_msg_id=1, text="你好", display_name="UserA")
+    )
+    await asyncio.sleep(0.12)
+    assert tg.probes_sent[-1] == (8001, cfg.llm.fallback_probe_message)
+
+    # Fixed probe mode forces static fallback even for clean LLM replies
+    cfg.actions.use_fixed_probe_message = True
+    await pipeline.handle_incoming_message(
+        IncomingMessage(user_id=8002, tg_msg_id=2, text="你好", display_name="UserB")
+    )
+    await asyncio.sleep(0.12)
+    assert tg.probes_sent[-1] == (8002, cfg.llm.fallback_probe_message)
+
+    await pipeline.shutdown()
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_userbot_send_probe_reply_disables_parse_mode_and_preview(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from antispam.config import AppConfig, EnvSettings, Settings
+    from antispam.telegram.userbot import UserbotClient
+
+    env = EnvSettings(
+        tg_api_id=12345,
+        tg_api_hash="hash",
+        bot_token="123:abc",
+        owner_id=999,
+        llm_api_key="sk-test",
+        tg_session_string="",
+        data_dir=tmp_path,
+    )
+    cfg = AppConfig()
+    cfg.actions.reply_delay_min_seconds = 0.0
+    cfg.actions.reply_delay_max_seconds = 0.0
+    cfg.actions.simulate_typing = False
+
+    userbot = UserbotClient(Settings(env=env, cfg=cfg))
+    userbot.client.get_input_entity = AsyncMock(return_value="peer_obj")  # type: ignore[method-assign]
+    userbot.client.send_message = AsyncMock(return_value=SimpleNamespace(id=777))  # type: ignore[method-assign]
+
+    msg_id = await userbot.send_probe_reply(123456, "**纯文本** 不渲染")
+    assert msg_id == 777
+    userbot.client.send_message.assert_awaited_once_with(
+        "peer_obj",
+        "**纯文本** 不渲染",
+        parse_mode=None,
+        link_preview=False,
+    )
+    userbot.client.session.close()

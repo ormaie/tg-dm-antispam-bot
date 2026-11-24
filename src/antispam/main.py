@@ -44,6 +44,7 @@ async def _run_service(config_path: Path | None) -> None:
         llm_cfg=settings.cfg.llm,
         media_cfg=settings.cfg.media,
         max_probe_rounds=settings.cfg.screening.max_probe_rounds,
+        max_probe_reply_chars=settings.cfg.actions.max_probe_reply_chars,
     )
 
     userbot = UserbotClient(settings)

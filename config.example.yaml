@@ -43,6 +43,10 @@ actions:
   auto_block_revoke_both: true
   # 自动拉黑时是否顺带向 Telegram 举报垃圾信息（默认关闭，保留在辅助 Bot 按钮上人工决定）
   auto_block_report_spam: false
+  # 若设为 true，自动追问永远只发送下方配置的固定 fallback_probe_message，不使用 LLM 生成的回复（极致安全）
+  use_fixed_probe_message: false
+  # 允许发出的自动追问话术最大字符数（超长或含链接/@/Markdown 链接时自动退回固定话术）
+  max_probe_reply_chars: 200
   # 自动回复前的拟人随机延迟（秒）
   reply_delay_min_seconds: 2.0
   reply_delay_max_seconds: 5.0
