@@ -215,37 +215,30 @@ class ModerationPipeline:
     async def handle_owner_outgoing(
         self,
         user_id: int,
-        text: str,
+        text: str = "",
         *,
         display_name: str | None = None,
         username: str | None = None,
         tg_msg_id: int | None = None,
     ) -> None:
-        """Called when the account owner manually sends a DM to `user_id`."""
+        """Called when the account owner manually sends a DM to `user_id`.
+
+        Only takes over users currently tracked in non-whitelisted states and never
+        persists the owner's outgoing plaintext messages to SQLite.
+        """
+        del text, display_name, username, tg_msg_id
         async with self._lock_for(user_id):
             self._cancel_pending(user_id)
             user = await self.db.get_user(user_id)
-            if user is None:
-                user = await self.db.get_or_create_user(
-                    user_id,
-                    display_name or str(user_id),
-                    username,
-                    default_status=UserStatus.WHITELISTED,
-                )
-            elif user.status != UserStatus.WHITELISTED:
-                await self.db.update_user_status(
-                    user_id,
-                    UserStatus.WHITELISTED,
-                    reason="机主已手动回复接管对话",
-                )
-                logger.info("Human takeover: user %s marked WHITELISTED", user_id)
+            if user is None or user.status == UserStatus.WHITELISTED:
+                return
 
-            await self.db.add_message(
-                user_id=user_id,
-                direction="out_owner",
-                text=text,
-                tg_msg_id=tg_msg_id,
+            await self.db.update_user_status(
+                user_id,
+                UserStatus.WHITELISTED,
+                reason="机主已手动回复接管对话",
             )
+            logger.info("Human takeover: user %s marked WHITELISTED", user_id)
 
             if user.archived:
                 await self.tg.archive_chat(user_id, False)

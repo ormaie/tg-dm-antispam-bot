@@ -627,3 +627,39 @@ async def test_daily_llm_budget_atomic_under_50_concurrent_calls(tmp_path: Path)
 
     await pipeline.shutdown()
     await db.close()
+
+
+@pytest.mark.asyncio
+async def test_owner_outgoing_never_persists_friends_or_plaintext_messages(tmp_path: Path) -> None:
+    db = Database(tmp_path / "privacy.db")
+    await db.connect()
+    tg = FakeTelegramActions()
+    notifier = FakeNotifier()
+    llm = FakeLLM()
+
+    pipeline = ModerationPipeline(
+        cfg=_fast_cfg(RunMode.AUTO), db=db, tg=tg, notifier=notifier, llm=llm  # type: ignore[arg-type]
+    )
+
+    # Messaging 3 normal friends must create zero user rows and zero message rows
+    for friend_id in (11, 12, 13):
+        await pipeline.handle_owner_outgoing(friend_id, f"给朋友 {friend_id} 的私密消息")
+        assert await db.get_user(friend_id) is None
+        assert await db.get_recent_messages(friend_id) == []
+
+    # Stranger enters screening, then owner manually takes over
+    await pipeline.handle_incoming_message(
+        IncomingMessage(user_id=14, tg_msg_id=1, text="你好我是同事", display_name="Colleague")
+    )
+    await pipeline.handle_owner_outgoing(14, "私密回复内容")
+    await pipeline.handle_owner_outgoing(14, "第二条私密回复")
+
+    user = await db.get_user(14)
+    assert user is not None and user.status == UserStatus.WHITELISTED
+    stored_msgs = await db.get_recent_messages(14)
+    assert len(stored_msgs) == 1
+    assert stored_msgs[0].direction == "in"
+    assert all(m.direction != "out_owner" for m in stored_msgs)
+
+    await pipeline.shutdown()
+    await db.close()

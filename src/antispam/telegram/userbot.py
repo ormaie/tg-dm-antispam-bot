@@ -190,21 +190,13 @@ class UserbotClient:
             return
 
         peer = await event.get_chat()
-        display_name: str | None = None
-        username: str | None = None
         if isinstance(peer, User):
+            if peer.contact:
+                return
             if peer.bot and self._cfg.screening.ignore_bots:
                 return
-            display_name = self._format_user_name(peer)
-            username = peer.username
 
-        await self._pipeline.handle_owner_outgoing(
-            chat_id,
-            (event.raw_text or "").strip(),
-            display_name=display_name,
-            username=username,
-            tg_msg_id=event.id,
-        )
+        await self._pipeline.handle_owner_outgoing(chat_id)
 
     def _register_in_flight_reply(self, user_id: int, text: str) -> None:
         now = time.monotonic()
